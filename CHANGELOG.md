@@ -2,6 +2,60 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v3.0.0] - 2025-12-03
+
+### ☁️ Major Update - HTTP API Integration & System Stability
+
+This release transforms the device from a local logger to a cloud-connected IoT device. It also addresses critical stability issues (heap corruption, race conditions) and optimizes performance for dual-core operation.
+
+---
+
+## ✨ New Features
+
+### 1. HTTP API Logging (Replaces SD Card)
+- **Async Logging**: Data transmission runs on Core 0 (Network Task) without blocking UI (Core 1).
+- **Queue Buffering**: 50-item FreeRTOS queue prevents data loss during network glitches.
+- **Configurable Endpoint**: Set API URL via serial command `SET_API <url>`.
+- **Fail-Fast**: 4s timeout and smart retry logic to prevent system freeze.
+
+### 2. Dual Core Architecture
+- **Core 1 (App Core)**: Dedicated to UI rendering and user interaction (100% responsive).
+- **Core 0 (Pro Core)**: Handles WiFi, HTTP requests, and sensor data acquisition.
+- **Thread Safety**: Implemented Mutexes for `sysData` and I2C bus protection.
+
+### 3. Network Configuration
+- **New Commands**:
+  - `SET_WIFI <ssid> <pass>`: Configure WiFi credentials.
+  - `SET_API <url>`: Configure backend endpoint.
+- **Persistent Storage**: Credentials saved in NVS (Preferences).
+
+### 4. Memory Optimization
+- **Safe Strings**: Replaced global `String` objects with `char` arrays to prevent heap fragmentation.
+- **Stack Safety**: Increased `loggingTask` stack to 12KB for safe HTTPS SSL handshakes.
+- **Efficient Sorting**: Switched to Insertion Sort for faster ADC noise filtering.
+
+---
+
+## 🐛 Critical Bug Fixes
+
+### 1. Heap Corruption (Device ID)
+- **Issue**: Passing `String` objects through `xQueueSend` caused double-free errors and reboots.
+- **Fix**: Replaced `String` with fixed-size `char[32]` in `LogItem` struct.
+
+### 2. Race Conditions (Data Tearing)
+- **Issue**: UI read data while Sensor Task was writing it, causing glitchy values.
+- **Fix**: Implemented `sysDataMutex` to ensure atomic access to shared data.
+
+### 3. Retry Storm (Blank Charts)
+- **Issue**: Queue full caused infinite retry loop, starving the UI task.
+- **Fix**: Updated logic to drop old data when queue is full, preserving system responsiveness.
+
+### 4. I2C Bus Contention
+- **Issue**: RTC accessed by multiple tasks simultaneously.
+- **Fix**: Implemented `i2cMutex` to serialize access to the DS3231 RTC.
+
+---
+
 ## [v2.0.0] - 2025-11-26
 
 ### 🎉 Major Update - Complete UI Overhaul & Error Handling

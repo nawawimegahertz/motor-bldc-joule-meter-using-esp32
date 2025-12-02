@@ -15,12 +15,8 @@
 #include <SPI.h>
 #include <TFT_eSPI.h>
 #include <Preferences.h>
-// LEGACY: SD Card libraries (commented for HTTP API mode)
-// #include <SD.h>
-// #include <FS.h>
-#include <WiFi.h>
-#include <HTTPClient.h>
-#include <ArduinoJson.h>  // For JSON payload construction
+#include <SD.h>
+#include <FS.h>
 #include <Wire.h>
 #include <RTClib.h>
 
@@ -30,11 +26,11 @@
 #define BUTTON_PIN 13
 #define LED_PIN 12
 
-// LEGACY: SD Card Pins (HSPI) - Commented for HTTP API mode
-// #define SD_CS_PIN 5
-// #define SD_SCK_PIN 18
-// #define SD_MISO_PIN 19
-// #define SD_MOSI_PIN 23
+// SD Card Pins (HSPI)
+#define SD_CS_PIN 5
+#define SD_SCK_PIN 18
+#define SD_MISO_PIN 19
+#define SD_MOSI_PIN 23
 
 // Sensor Pins
 const int sensorPin = 36;
@@ -53,8 +49,8 @@ const float ADC_resolution = 4095.0;
 // ============================================================================
 // CALIBRATION SETTINGS
 // ============================================================================
-#define MAX_CAL_POINTS 12 // init value: 6
-#define MIN_CAL_POINTS 6  // init value: 3
+#define MAX_CAL_POINTS 6
+#define MIN_CAL_POINTS 3
 
 struct CalPoint {
     float rawADC;
@@ -148,33 +144,11 @@ enum WaveMode { SINE, SQUARE, TRIANGLE, SAWTOOTH, NOISE };
 // GLOBAL OBJECTS
 // ============================================================================
 TFT_eSPI tft = TFT_eSPI();
-// LEGACY: SD Card SPI instance
-// SPIClass sdSPI(HSPI);
-// File currentLogFile;
+SPIClass sdSPI(HSPI);  // SD Card SPI instance
 Preferences prefs;
 Preferences calPrefs;
 RTC_DS3231 rtc;
-
-// Network Configuration
-// Network Configuration
-char wifiSSID[33] = "";      // Max 32 chars + null
-char wifiPassword[65] = "";  // Max 64 chars + null
-char apiBaseURL[128] = "";   // Max 127 chars + null
-String deviceId = "";           // Format: "esp32-XX:XX:XX:XX:XX:XX"
-
-// Queue for async logging
-struct LogItem {
-    float voltage;
-    float i_used;
-    float i_regen;
-    float wh_used;
-    float wh_regen;
-    unsigned long timestamp; // Epoch time
-    char deviceId[32]; // Fixed size for Queue safety (String causes heap corruption)
-};
-QueueHandle_t logQueue;
-SemaphoreHandle_t sysDataMutex;
-SemaphoreHandle_t i2cMutex;
+File currentLogFile;
 
 // ============================================================================
 // GLOBAL VARIABLES
@@ -189,37 +163,15 @@ int calib_volt_count = 0;
 bool calib_rtc_done = false;
 bool calib_ui_update = true;
 
-// Network Status
-bool wifiConnected = false;
-int wifiRSSI = 0;
-int lastHTTPCode = 0;
-String lastHTTPStatus = "INIT";
-unsigned long rateLimitUntil = 0;  // Timestamp when rate limit expires
-bool isRateLimited = false;
-
-// Timing for API requests (1 request per second = safe margin)
-unsigned long lastAPIRequest = 0;
-const unsigned long API_REQUEST_INTERVAL = 1000; // 1000ms = 1 second
-
-// Retry configuration
-// Retry configuration
-const int MAX_HTTP_RETRIES = 2; // Reduced from 3 to prevent queue backup
-const int RETRY_BASE_DELAY_MS = 1000;
-
 // Logging Status
 bool isLogging = false;
+bool sdReady = false;
 bool rtcReady = false;
 unsigned long logIteration = 0;
-
-// LEGACY: SD Card variables (kept for compilation compatibility)
-bool sdReady = false;
 String lastSavedFilename = "";
 unsigned long lastSavedFileSize = 0;
 bool hasLoggedBefore = false;
 bool showFileInfoSlide = false;
-bool sdErrorOccurred = false;
-String sdErrorCode = "";
-String sdErrorMsg = "";
 
 // Button Handling
 int buttonState;
@@ -234,6 +186,11 @@ bool sensorSystemValid = false;
 
 // Chart persistence
 bool chartsFirstInit = true;
+
+// SD Error handling
+bool sdErrorOccurred = false;
+String sdErrorCode = "";
+String sdErrorMsg = "";
 
 // Voltage smoothing for display (reduce decimal flickering)
 float displayVoltage = 0.0;
@@ -256,15 +213,15 @@ float getMedianADC(int pin, int samples) {
         delayMicroseconds(50);
     }
     
-    // Insertion Sort (Faster for small N)
-    for (int i = 1; i < samples; i++) {
-        int key = raw[i];
-        int j = i - 1;
-        while (j >= 0 && raw[j] > key) {
-            raw[j + 1] = raw[j];
-            j = j - 1;
+    // Bubble sort
+    for (int i = 0; i < samples - 1; i++) {
+        for (int j = 0; j < samples - i - 1; j++) {
+            if (raw[j] > raw[j + 1]) {
+                int temp = raw[j];
+                raw[j] = raw[j + 1];
+                raw[j + 1] = temp;
+            }
         }
-        raw[j + 1] = key;
     }
     
     return (float)raw[samples / 2];
@@ -372,254 +329,6 @@ void calculateAutoOffset() {
     I_offset = (V_ADC / I_divider_factor) * I_scale_factor;
     saveCalibrationSensor();
 }
-
-// ============================================================================
-// NETWORK FUNCTIONS (HTTP API)
-// ============================================================================
-
-/**
- * Connect to WiFi with timeout
- */
-void connectToWiFi() {
-    if (strlen(wifiSSID) == 0) {
-        Serial.println(F(">> ERROR: WiFi SSID not configured"));
-        Serial.println(F(">> Use: SET_WIFI <ssid> <password>"));
-        return;
-    }
-    
-    Serial.println(F(">> Connecting to WiFi..."));
-    Serial.print(F(">> SSID: "));
-    Serial.println(wifiSSID);
-    
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(wifiSSID, wifiPassword);
-    
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 30) {
-        delay(500);
-        Serial.print(".");
-        attempts++;
-    }
-    
-    if (WiFi.status() == WL_CONNECTED) {
-        wifiConnected = true;
-        wifiRSSI = WiFi.RSSI();
-        Serial.println(F("\n>> WiFi Connected!"));
-        Serial.print(F(">> IP: "));
-        Serial.println(WiFi.localIP());
-        Serial.print(F(">> RSSI: "));
-        Serial.print(wifiRSSI);
-        Serial.println(F(" dBm"));
-    } else {
-        wifiConnected = false;
-        Serial.println(F("\n>> WiFi Connection Failed!"));
-    }
-}
-
-/**
- * Ensure WiFi is connected, reconnect if needed
- */
-void ensureWiFiConnected() {
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.println(F(">> WiFi disconnected, reconnecting..."));
-        wifiConnected = false;
-        connectToWiFi();
-    } else {
-        wifiConnected = true;
-        wifiRSSI = WiFi.RSSI(); // Update signal strength
-    }
-}
-
-/**
- * Perform health check on API endpoint
- * Returns true if API is healthy (200 OK), false otherwise
- */
-bool checkAPIHealth() {
-    if (strlen(apiBaseURL) == 0) {
-        Serial.println(F(">> ERROR: API URL not configured"));
-        Serial.println(F(">> Use: SET_API <url>"));
-        return false;
-    }
-    
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.println(F(">> SKIP: WiFi not connected"));
-        return false;
-    }
-    
-    HTTPClient http;
-    String healthURL = String(apiBaseURL) + "/health";
-    
-    Serial.print(F(">> Health Check: "));
-    Serial.println(healthURL);
-    
-    http.begin(healthURL);
-    http.setTimeout(5000); // 5 second timeout
-    
-    int httpCode = http.GET();
-    String response = http.getString();
-    http.end();
-    
-    lastHTTPCode = httpCode; // Store for system check
-    
-    if (httpCode == 200) {
-        Serial.println(F(">> API Health: OK"));
-        Serial.println(response);
-        return true;
-    } else {
-        Serial.printf(">> API Health: FAIL (HTTP %d)\n", httpCode);
-        Serial.println(response);
-        Serial.println(F(">> WARNING: Continuing anyway (fail-soft)"));
-        return false;
-    }
-}
-
-/**
- * Send sensor data to API with retry logic
- * Returns true if successfully sent (HTTP 201), false otherwise
- */
-/**
- * Send sensor data to API with retry logic
- * Returns true if successfully sent (HTTP 201), false otherwise
- */
-/**
- * Send sensor data to API with retry logic
- * Returns true if successfully sent (HTTP 201), false otherwise
- */
-bool sendDataWithRetry(LogItem item) {
-    // Validate WiFi connection
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.println(F(">> SKIP: WiFi not connected"));
-        lastHTTPStatus = "NO WIFI";
-        ensureWiFiConnected(); // Try to reconnect
-        return false;
-    }
-    
-    // Check rate limit
-    if (isRateLimited && millis() < rateLimitUntil) {
-        // Still rate limited, don't send
-        return false;
-    } else if (millis() >= rateLimitUntil) {
-        // Rate limit expired
-        isRateLimited = false;
-    }
-    
-    // Validate sensor data (no NaN or Inf)
-    if (isnan(item.voltage) || isinf(item.voltage) ||
-        isnan(item.i_used) || isinf(item.i_used) ||
-        isnan(item.i_regen) || isinf(item.i_regen)) {
-        Serial.println(F(">> SKIP: Invalid sensor data (NaN/Inf)"));
-        return false;
-    }
-    
-    // Build JSON payload
-    StaticJsonDocument<256> doc;
-    doc["deviceId"] = item.deviceId;
-    doc["currentUsed"] = item.i_used;
-    doc["currentRegen"] = item.i_regen;
-    doc["power"] = item.voltage * (item.i_used - item.i_regen);
-    doc["voltage"] = item.voltage;
-    doc["whUsed"] = item.wh_used;
-    doc["whRegen"] = item.wh_regen;
-    doc["rtcTime"] = item.timestamp;
-    
-    String payload;
-    serializeJson(doc, payload);
-    
-    // DEBUG: Print payload
-    Serial.print(F(">> Sending Payload: "));
-    Serial.println(payload);
-    
-    // Retry loop with exponential backoff
-    for (int attempt = 0; attempt < MAX_HTTP_RETRIES; attempt++) {
-        HTTPClient http;
-        String ingestURL = String(apiBaseURL) + "/ingest";
-        
-        http.begin(ingestURL);
-        http.addHeader("Content-Type", "application/json");
-        http.setTimeout(4000); // Reduced to 4s to fail fast
-        http.setReuse(false);  // Force close connection to prevent stale socket issues
-        
-        int httpCode = http.POST(payload);
-        String response = http.getString();
-        http.end();
-        
-        lastHTTPCode = httpCode;
-        
-        // Handle response codes
-        if (httpCode == 201) {
-            // Success!
-            lastHTTPStatus = "201 OK";
-            Serial.println(F(">> HTTP 201: Data saved"));
-            
-            // Blink LED briefly
-            digitalWrite(LED_PIN, HIGH);
-            delay(50);
-            digitalWrite(LED_PIN, LOW);
-            
-            return true;
-            
-        } else if (httpCode == 429) {
-            // Rate limited - BLOCK for 10 seconds
-            lastHTTPStatus = "429 WAIT";
-            isRateLimited = true;
-            rateLimitUntil = millis() + 10000; // 10 seconds from now
-            
-            Serial.println(F(">> HTTP 429: Rate Limited!"));
-            Serial.println(F(">> BLOCKING for 10 seconds..."));
-            
-            // Blocking delay (as per requirements)
-            delay(10000);
-            
-            return false; // Don't retry immediately
-            
-        } else if (httpCode >= 500) {
-            // Server error - retry with exponential backoff
-            lastHTTPStatus = String(httpCode) + " ERR";
-            Serial.printf(">> HTTP %d: Server error\n", httpCode);
-            Serial.println(response);
-            
-            if (attempt < MAX_HTTP_RETRIES - 1) {
-                int backoffDelay = RETRY_BASE_DELAY_MS * pow(2, attempt);
-                Serial.printf(">> Retry %d/%d in %dms\n", attempt + 1, MAX_HTTP_RETRIES, backoffDelay);
-                delay(backoffDelay);
-            }
-            
-        } else if (httpCode == 400) {
-            // Bad request - don't retry
-            lastHTTPStatus = "400 BAD";
-            Serial.println(F(">> HTTP 400: Bad Request"));
-            Serial.print(F(">> Payload: "));
-            Serial.println(payload);
-            Serial.println(response);
-            return false;
-            
-        } else {
-            // Other errors
-            lastHTTPStatus = String(httpCode) + " ERR";
-            Serial.printf(">> HTTP %d: %s\n", httpCode, response.c_str());
-            return false;
-        }
-    }
-    
-    // All retries exhausted
-    Serial.println(F(">> FAILED: All retries exhausted"));
-    lastHTTPStatus = "RETRY FAIL";
-    return false;
-}
-
-/**
- * Async logging task running on Core 0 (Low Priority)
- */
-void loggingTask(void *parameter) {
-    LogItem item;
-    for (;;) {
-        // Wait for item in queue (blocking)
-        if (xQueueReceive(logQueue, &item, portMAX_DELAY) == pdTRUE) {
-            sendDataWithRetry(item);
-        }
-    }
-}
-
 
 // ============================================================================
 // UI ANIMATION FUNCTIONS
@@ -986,7 +695,7 @@ void runSystemCheck() {
     int gapY = 32; // Jarak antar item dirapatkan sedikit agar muat
     int currentY = startY;
 
-    const char* components[] = { "RTC DS3231", "WiFi Conn", "API Check", "Sensor Volt" };
+    const char* components[] = { "RTC DS3231", "SD Card", "Sensor Arus", "Sensor Volt" };
     int compCount = 4;
     
     bool overallStatus = true; 
@@ -1011,13 +720,9 @@ void runSystemCheck() {
         bool result = false;
         switch(i) {
             case 0: result = rtcReady; break;            // Pastikan variabel ini ada
-            case 1: result = wifiConnected; break;             // Check WiFi instead of SD
-            case 2: result = (lastHTTPCode == 200); break;     // Check API Health (from setup)
-            case 3: 
-                // Check if calibrated OR if raw ADC detects voltage (> 0.2V approx)
-                // This prevents failure if uncalibrated but connected, or calibrated but 0V
-                result = (calPointCount >= 1) || (analogRead(batteryPin) > 50); 
-                break;
+            case 1: result = sdReady; break;             // Pastikan variabel ini ada
+            case 2: result = true; break;                // Contoh logic
+            case 3: result = (calPointCount >= 1); break; // Contoh logic
         }
 
         if (!result) overallStatus = false;
@@ -1650,15 +1355,6 @@ private:
         }
     }
 
-    // Helper: Print Text in Footer (New for HTTP Status)
-    void printFooterText(int x, int y, String text, uint16_t color) {
-        tft->fillRect(x, y, 60, 10, C_BG_MAIN); // Clear area
-        tft->setCursor(x, y);
-        tft->setTextColor(color, C_BG_MAIN);
-        tft->setTextSize(1);
-        tft->print(text);
-    }
-
 public:
     Slide3_Dashboard(TFT_eSPI *display) : tft(display) {}
 
@@ -1683,21 +1379,13 @@ public:
         printValue(5, data.wh_regen, 2, "Wh", COLOR_CYAN);// Energy Regen
         
         // Data Footer (Teks Kecil)
-        // Data Footer (Network Status)
-        // HTTP Status
-        uint16_t statusColor = TFT_WHITE;
-        if (lastHTTPCode == 201) statusColor = COLOR_GREEN;
-        else if (lastHTTPCode == 429) statusColor = COLOR_RED;
-        else if (lastHTTPCode >= 500) statusColor = TFT_ORANGE;
-        else if (lastHTTPCode == 0) statusColor = TFT_LIGHTGREY;
-        
-        printFooterText(75, 230, lastHTTPStatus, statusColor);
-        
-        // WiFi RSSI
-        if (wifiConnected) {
-            printFooterText(180, 230, String(wifiRSSI) + " dBm", TFT_WHITE);
+        if (isLogging) {
+            printValue(6, (float)data.iteration, 0, "", TFT_WHITE);     // Loop Iter
+            printValue(7, (float)data.uptime_sec, 0, "", TFT_WHITE); // Uptime
         } else {
-            printFooterText(180, 230, "No WiFi", COLOR_RED);
+            // Clear footer values if not logging
+             tft->fillRect(75, 230, 40, 10, C_BG_MAIN);
+             tft->fillRect(180, 230, 40, 10, C_BG_MAIN);
         }
         
         drawPageNumber(3);
@@ -1746,11 +1434,10 @@ private:
         tft->setTextColor(0x7BEF, C_BG_MAIN);
         
         tft->setCursor(10, 230);
-        tft->setCursor(10, 230);
-        tft->print("HTTP:");
+        tft->print("Loop Iter:");
         
         tft->setCursor(130, 230);
-        tft->print("RSSI:");
+        tft->print("Uptime:");
     }
 };
 
@@ -1781,60 +1468,145 @@ public:
 
 private:
     void drawContent() {
-        // Draw WiFi Icon (Simple representation)
-        int cx = 120;
-        int cy = 60;
-        
-        // Dot
-        tft->fillCircle(cx, cy + 20, 4, COLOR_GREEN);
-        
-        // Arcs (using circles and masking)
-        // Arc 1
-        tft->drawCircle(cx, cy + 20, 15, TFT_WHITE);
-        tft->drawCircle(cx, cy + 20, 16, TFT_WHITE);
-        tft->fillRect(cx - 20, cy + 20, 40, 20, COLOR_BG);
-        
-        // Arc 2
-        tft->drawCircle(cx, cy + 20, 25, TFT_WHITE);
-        tft->drawCircle(cx, cy + 20, 26, TFT_WHITE);
-        tft->fillRect(cx - 30, cy + 20, 60, 30, COLOR_BG);
-        
-        // Arc 3
-        // Arc 3
-        tft->drawCircle(cx, cy + 20, 35, TFT_WHITE);
-        tft->drawCircle(cx, cy + 20, 36, TFT_WHITE);
-        tft->fillRect(cx - 40, cy + 20, 80, 40, COLOR_BG);
-        
-        // Title
-        tft->setTextColor(CALIB_COLOR_DONE, COLOR_BG);
-        tft->setTextSize(2);
-        String title = "DATA SENT!";
-        tft->setCursor((240 - tft->textWidth(title)) / 2, 110); 
-        tft->print(title);
-        
-        // Info Box
-        int infoBoxY = 140;
-        tft->drawFastHLine(20, infoBoxY, 200, TFT_GREY);
-        tft->drawFastHLine(20, infoBoxY + 60, 200, TFT_GREY);
-        
-        // Total Points
-        tft->setTextSize(1);
-        tft->setTextColor(0xBDF7, COLOR_BG);
-        tft->setCursor(30, infoBoxY + 10);
-        tft->print("Total Points Sent:");
-        
-        tft->setTextSize(2);
-        tft->setTextColor(TFT_WHITE, COLOR_BG);
-        tft->setCursor(30, infoBoxY + 25);
-        tft->print(logIteration);
-        
-        // Device ID
-        tft->setTextSize(1);
-        tft->setTextColor(0xBDF7, COLOR_BG);
-        tft->setCursor(30, infoBoxY + 45);
-        tft->print("ID: " + deviceId);
+        // Bersihkan area (opsional, tergantung implementasi parent function)
+        // tft->fillScreen(COLOR_BG); 
 
-        // Footer Instruction
+        // --- 1. KONFIGURASI GEOMETRI SD CARD 3D ---
+        int cx = 120;       // Pusat X
+        int cy = 70;        // Pusat Y (ikon SD Card)
+        
+        int sdW = 50;       // Lebar SD Card
+        int sdH = 70;       // Tinggi SD Card
+        int depth = 6;      // Ketebalan 3D
+        int tilt = 10;      // Kemiringan (Skew) ke kanan
+        int cutSize = 12;   // Ukuran potongan sudut kanan atas
+
+        // Koordinat Dasar (Front Face)
+        // Kita hitung 4 sudut dasar persegi panjang miring
+        int topX = cx + tilt; 
+        int topY = cy - (sdH / 2);
+        int botX = cx;
+        int botY = cy + (sdH / 2);
+        
+        // Sudut-sudut Muka Depan
+        int xTL = topX - (sdW / 2);      int yTL = topY;
+        int xTR = topX + (sdW / 2);      int yTR = topY; // Ini nanti dipotong
+        int xBR = botX + (sdW / 2);      int yBR = botY;
+        int xBL = botX - (sdW / 2);      int yBL = botY;
+
+        // --- 2. GAMBAR SD CARD BODY ---
+        
+        // A. Bayangan/Ketebalan 3D (Sisi Kanan & Bawah)
+        // Sisi Kanan
+        fillQuad(xTR, yTR + cutSize, xTR + depth, yTR + cutSize, xBR + depth, yBR, xBR, yBR, C_HOUSING_SIDE);
+        // Sisi Bawah
+        fillQuad(xBR, yBR, xBR + depth, yBR, xBL + depth, yBL, xBL, yBL, C_HOUSING_SIDE);
+        // Sudut Potongan (Miring)
+        fillQuad(xTR - cutSize, yTR, xTR - cutSize + depth, yTR, xTR + depth, yTR + cutSize, xTR, yTR + cutSize, C_HOUSING_SIDE);
+
+        // B. Muka Depan (Main Body) - Warna Gelap (Housing)
+        // Kita gambar Rect penuh dulu, nanti "ditambal" background untuk potongan sudut
+        fillQuad(xTL, yTL, xTR, yTR, xBR, yBR, xBL, yBL, C_HOUSING_FRONT);
+        
+        // C. Buat Efek "Cut Corner" (Potong sudut kanan atas)
+        // Caranya: Timpa segitiga pojok kanan atas dengan warna background
+        tft->fillTriangle(xTR, yTR, xTR, yTR + cutSize, xTR - cutSize, yTR, COLOR_BG); 
+
+        // D. Stiker Label (Area terang di tengah SD Card)
+        int margin = 5;
+        fillQuad(xTL + margin, yTL + 15, xTR - margin - cutSize + 2, yTL + 15, 
+                xBR - margin, yBR - 10, xBL + margin, yBR - 10, C_POLE); // Warna abu terang
+
+        // E. Pins (Kuningan di bawah)
+        int pinW = 4; int pinGap = 2;
+        int startPinX = xBL + 10;
+        int startPinY = yBR - 8; // Sedikit di atas bawah
+        for(int i=0; i<7; i++) { // 7 Pin standar SD Card
+            int px = startPinX + (i * (pinW + pinGap));
+            // Sesuaikan kemiringan pin
+            fillQuad(px, startPinY, px + pinW, startPinY, 
+                    px + pinW - 2, yBR - 2, px - 2, yBR - 2, TFT_ORANGE);
+        }
+
+        // --- 3. GAMBAR CEKLIS (ANIMASI STROKE) ---
+        // Ceklis berada di tengah ikon SD Card
+        int checkCX = cx; 
+        int checkCY = cy + 5;
+        int thick = 4; // Ketebalan garis ceklis
+
+        // Kita gambar lingkaran latar hijau dulu (seperti stiker QC Pass)
+        tft->fillCircle(checkCX, checkCY, 22, CALIB_COLOR_DONE);
+        tft->drawCircle(checkCX, checkCY, 22, TFT_WHITE); // Ring putih
+
+        // Animasi Menggambar Ceklis (Putih)
+        // Titik sudut ceklis: (Kiri, Bawah, KananAtas)
+        int p1x = checkCX - 10; int p1y = checkCY;
+        int p2x = checkCX - 2;  int p2y = checkCY + 8;
+        int p3x = checkCX + 12; int p3y = checkCY - 8;
+
+        // Stroke 1: Turun
+        for(int i=0; i<=8; i+=2) {
+            tft->fillCircle(p1x + i, p1y + i, 2, TFT_WHITE); // Pakai circle biar ujungnya bulat
+            // delay(5); // Opsional: delay mikro untuk efek (hati-hati blocking)
+        }
+        // Stroke 2: Naik
+        for(int i=0; i<=14; i+=2) {
+            tft->fillCircle(p2x + i, p2y - i, 2, TFT_WHITE);
+        }
+        // Rapikan sudut pertemuan
+        tft->fillCircle(p2x, p2y, 2, TFT_WHITE);
+
+
+        // --- 4. TIPOGRAFI & DATA (CARD UI STYLE) ---
+        
+        // HEADER: TERSIMPAN
+        tft->setTextColor(CALIB_COLOR_DONE, COLOR_BG);
+        tft->setTextSize(2); // Pastikan font mendukung
+        String title = "TERSIMPAN!";
+        // Geser Y ke 120 agar tidak nabrak ikon
+        tft->setCursor((240 - tft->textWidth(title)) / 2, 120); 
+        tft->print(title);
+
+        // KOTAK INFO FILE (Background tipis agar rapi)
+        int infoBoxY = 145;
+        int infoBoxH = 55;
+        // Garis pemisah atas & bawah estetik
+        tft->drawFastHLine(20, infoBoxY, 200, TFT_GREY);
+        tft->drawFastHLine(20, infoBoxY + infoBoxH, 200, TFT_GREY);
+
+        // File Name Label (Kecil, Abu/Biru Muda)
+        tft->setTextSize(1);
+        tft->setTextColor(COLOR_TEXT_L, COLOR_BG);
+        tft->setCursor(30, infoBoxY + 8);
+        tft->print("NAMA FILE:");
+
+        // File Name Value (Besar/Putih)
+        tft->setTextSize(1); // Atau 2 jika nama file pendek
+        tft->setTextColor(COLOR_TEXT_V, COLOR_BG);
+        tft->setCursor(30, infoBoxY + 20);
+        if (lastSavedFilename.length() > 0) {
+            tft->print(lastSavedFilename);
+        } else {
+            tft->setTextColor(CALIB_COLOR_WARN, COLOR_BG); // Merah jika error
+            tft->print("ERROR / NO FILE");
+        }
+
+        // Size Value (Di kanan, sejajar nama file)
+        // Trik: Cetak label SIZE di kanan
+        tft->setTextColor(COLOR_TEXT_L, COLOR_BG);
+        tft->setCursor(150, infoBoxY + 8);
+        tft->print("UKURAN:");
+        
+        tft->setTextColor(COLOR_TEXT_V, COLOR_BG);
+        tft->setCursor(150, infoBoxY + 20);
+        float fileSizeKB = lastSavedFileSize / 1024.0;
+        char sizeBuffer[16];
+        dtostrf(fileSizeKB, 1, 1, sizeBuffer); // 1 desimal cukup
+        tft->print(sizeBuffer);
+        tft->print(" kB");
+
+        // FOOTER (Instruksi)
+        // Gunakan warna redup atau C_POLE_SHADE
         tft->setTextSize(1);
         tft->setCursor((240 - tft->textWidth("Tekan tombol untuk lanjut")) / 2, 220);
         tft->setTextColor(TFT_WHITE, COLOR_BG);
@@ -1848,38 +1620,37 @@ private:
 // SD CARD & SERIAL FUNCTIONS
 // ============================================================================
 
-// Global variables for SD card
-// Global variables for SD card (Removed duplicate definition)
-// bool sdReady = false; // Defined at top
-// SPIClass sdSPI(VSPI); // Not needed if legacy code commented out
-
-// ============================================================================
-// LEGACY: SD CARD FUNCTIONS (Commented for HTTP API mode)
-// ============================================================================
-
-/*
+/**
+ * Initialize SD card on HSPI pins with proper reset sequence
+ * This function includes retry logic to handle SD card state issues after power cycles
+ */
 void initSDCard() {
     sdReady = false;
     
     Serial.println(">> Initializing SD Card...");
     
+    // Step 1: Set CS pin HIGH to deselect SD card (important for reset)
     pinMode(SD_CS_PIN, OUTPUT);
     digitalWrite(SD_CS_PIN, HIGH);
     delay(10);
     
+    // Step 2: End any previous SPI/SD session to clear state
     sdSPI.end();
     SD.end();
-    delay(100);
+    delay(100);  // Allow SD card internal state to reset
     
+    // Step 3: Initialize SPI bus
     sdSPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
     delay(50);
     
+    // Step 4: Try to initialize SD card with retry mechanism
     const int maxRetries = 3;
-    const unsigned long spiSpeed = 1000000;
+    const unsigned long spiSpeed = 1000000;  // 1MHz for better reliability
     
     for (int attempt = 1; attempt <= maxRetries; attempt++) {
         Serial.printf(">> SD Card init attempt %d/%d...\n", attempt, maxRetries);
         
+        // Toggle CS pin before each attempt
         digitalWrite(SD_CS_PIN, HIGH);
         delay(10);
         digitalWrite(SD_CS_PIN, LOW);
@@ -1887,12 +1658,14 @@ void initSDCard() {
         digitalWrite(SD_CS_PIN, HIGH);
         delay(50);
         
+        // Try to begin SD card
         if (SD.begin(SD_CS_PIN, sdSPI, spiSpeed)) {
             uint8_t cardType = SD.cardType();
             
             if (cardType != CARD_NONE) {
                 sdReady = true;
                 
+                // Print card info
                 Serial.println(">> SD Card OK!");
                 Serial.print(">> Card Type: ");
                 if (cardType == CARD_MMC) {
@@ -1908,12 +1681,13 @@ void initSDCard() {
                 uint64_t cardSize = SD.cardSize() / (1024 * 1024);
                 Serial.printf(">> Card Size: %lluMB\n", cardSize);
                 
-                return;
+                return;  // Success!
             } else {
                 Serial.println(">> No SD card detected");
             }
         }
         
+        // If not last attempt, wait before retry
         if (attempt < maxRetries) {
             Serial.println(">> Retrying...");
             SD.end();
@@ -1921,11 +1695,15 @@ void initSDCard() {
         }
     }
     
+    // All attempts failed
     Serial.println(">> SD Card FAIL (Check card/pins/connections)");
     Serial.println(">> Will retry on next logging attempt");
 }
 
-void oldStartLogging() {
+/**
+ * Start data logging to SD card
+ */
+void startLogging() {
     // Check if SD card is ready, if not try to re-initialize
     if (!sdReady) {
         Serial.println(">> SD not ready, attempting re-init...");
@@ -1971,7 +1749,10 @@ void oldStartLogging() {
     }
 }
 
-void oldStopLogging() {
+/**
+ * Stop data logging
+ */
+void stopLogging() {
     isLogging = false;
     
     bool savedSuccessfully = false;
@@ -2005,69 +1786,10 @@ void oldStopLogging() {
         delay(2000);
     }
 }
-*/
 
 // ============================================================================
-// HTTP API LOGGING FUNCTIONS (NEW)
+// SD CARD HELPER FUNCTIONS
 // ============================================================================
-
-/**
- * Start data logging via HTTP API
- */
-void startLogging() {
-    // Check WiFi connection
-    if (!wifiConnected || WiFi.status() != WL_CONNECTED) {
-        Serial.println(F(">> Cannot start logging - WiFi not connected"));
-        Serial.println(F(">> Use: SET_WIFI <ssid> <password>"));
-        return;
-    }
-    
-    // Check API URL configured
-    if (strlen(apiBaseURL) == 0) {
-        Serial.println(F(">> Cannot start logging - API URL not configured"));
-        Serial.println(F(">> Use: SET_API <url>"));
-        return;
-    }
-    
-    // Reset energy counters
-    logIteration = 0;
-    sysData.wh_used = 0;
-    sysData.wh_regen = 0;
-    isLogging = true;
-    
-    Serial.println(F(">> HTTP API Logging started"));
-    Serial.print(F(">> Device ID: "));
-    Serial.println(deviceId);
-    Serial.print(F(">> Endpoint: "));
-    Serial.print(F(">> Endpoint: "));
-    Serial.print(apiBaseURL);
-    Serial.println("/ingest");
-    
-    drawStartLoggingUI();
-}
-
-/**
- * Stop data logging
- */
-void stopLogging() {
-    isLogging = false;
-    
-    // Clear queue to ensure immediate stop
-    LogItem dummy;
-    while(xQueueReceive(logQueue, &dummy, 0) == pdTRUE);
-    
-    Serial.println(F(">> Logging stopped"));
-    Serial.println(F(">> Queue flushed"));
-    Serial.printf(">> Total iterations: %lu\n", logIteration);
-    
-    drawStopLoggingUI();
-}
-
-
-// ============================================================================
-// LEGACY: SD CARD HELPER FUNCTIONS (Commented for HTTP API mode)
-// ============================================================================
-/*
 void listDir(fs::FS &fs, const char * dirname, uint8_t levels) {
     Serial.printf("Listing directory: %s\n", dirname);
 
@@ -2128,7 +1850,6 @@ void deleteAllFiles(fs::FS &fs) {
     // Refresh list
     listDir(fs, "/", 0);
 }
-*/
 
 /**
  * Process serial commands
@@ -2150,13 +1871,7 @@ void processSerial(String input) {
         Serial.println(F(">> COMMAND: RESET_ALL"));
         Serial.println(F(">> ACTION: Resetting all calibration data..."));
         
-        prefs.begin("calib_ui", false);
         prefs.clear();
-        prefs.end();
-        
-        calPrefs.begin("sensor_cal", false);
-        calPrefs.clear();
-        calPrefs.end();
         calib_curr_done = false;
         calib_volt_count = 0;
         calib_rtc_done = false;
@@ -2173,9 +1888,7 @@ void processSerial(String input) {
         
         if (!calib_curr_done) {
             calib_curr_done = true;
-            prefs.begin("calib_ui", false);
             prefs.putBool("c_curr", true);
-            prefs.end();
             calib_ui_update = true;
             calculateAutoOffset();
             
@@ -2193,25 +1906,20 @@ void processSerial(String input) {
         
         Serial.printf(">> PARAM: Voltage = %.2f V\n", voltage);
         
-        if (voltage > 0 && calib_volt_count < MAX_CAL_POINTS) {
+        if (voltage > 0 && calib_volt_count < 3) {
             Serial.printf(">> ACTION: Adding calibration point #%d...\n", calib_volt_count + 1);
             
             addOrUpdateCalPoint(voltage);
             calib_volt_count++;
-            prefs.begin("calib_ui", false);
             prefs.putInt("c_volt_n", calib_volt_count);
-            prefs.end();
             calib_ui_update = true;
             
-            Serial.printf(">> STATUS: ✓ Point added (%d/%d)\n", calib_volt_count, MAX_CAL_POINTS);
+            Serial.printf(">> STATUS: ✓ Point added (%d/3)\n", calib_volt_count);
             
-            if (calib_volt_count >= MIN_CAL_POINTS) {
-                Serial.println(F(">> INFO: Voltage calibration valid (Minimum reached)"));
-                if (calib_volt_count < MAX_CAL_POINTS) {
-                     Serial.printf(">> INFO: Can add %d more points for better accuracy\n", MAX_CAL_POINTS - calib_volt_count);
-                }
+            if (calib_volt_count >= 3) {
+                Serial.println(F(">> INFO: Voltage calibration complete!"));
             } else {
-                Serial.printf(">> INFO: Need %d more points for minimum\n", MIN_CAL_POINTS - calib_volt_count);
+                Serial.printf(">> INFO: Need %d more points\n", 3 - calib_volt_count);
             }
         } 
         else if (voltage <= 0) {
@@ -2219,9 +1927,9 @@ void processSerial(String input) {
             Serial.println(F(">> ERROR: Voltage must be > 0"));
             Serial.println(F(">> USAGE: v<voltage> (e.g., v12.5)"));
         }
-        else if (calib_volt_count >= MAX_CAL_POINTS) {
+        else if (calib_volt_count >= 3) {
             Serial.println(F(">> STATUS: ⚠ LIMIT REACHED"));
-            Serial.printf(">> ERROR: Already have %d calibration points\n", MAX_CAL_POINTS);
+            Serial.println(F(">> ERROR: Already have 3 calibration points"));
             Serial.println(F(">> INFO: Use 'reset_all' to restart calibration"));
         }
     }
@@ -2237,17 +1945,9 @@ void processSerial(String input) {
                          year, month, day, hour, minute, second);
             Serial.println(F(">> ACTION: Setting RTC time..."));
             
-            Serial.println(F(">> ACTION: Setting RTC time..."));
-            
-            if (xSemaphoreTake(i2cMutex, portMAX_DELAY) == pdTRUE) {
-                rtc.adjust(DateTime(year, month, day, hour, minute, second));
-                xSemaphoreGive(i2cMutex);
-            }
-            
+            rtc.adjust(DateTime(year, month, day, hour, minute, second));
             calib_rtc_done = true;
-            prefs.begin("calib_ui", false);
             prefs.putBool("c_rtc", true);
-            prefs.end();
             calib_ui_update = true;
             
             Serial.println(F(">> STATUS: ✓ RTC time set successfully"));
@@ -2261,86 +1961,14 @@ void processSerial(String input) {
         }
     }
     
-    // --- NETWORK CONFIGURATION COMMANDS (NEW) ---
+    // --- FILE MANAGEMENT COMMANDS (NEW) ---
     
-    // Command: SET_WIFI <ssid> <password>
-    else if (input.startsWith("SET_WIFI ")) {
-        Serial.println(F(">> COMMAND: SET_WIFI"));
-        
-        int firstSpace = input.indexOf(' ');
-        int secondSpace = input.indexOf(' ', firstSpace + 1);
-        
-        if (secondSpace > 0) {
-            String s_ssid = input.substring(firstSpace + 1, secondSpace);
-            String s_pass = input.substring(secondSpace + 1);
-            
-            strncpy(wifiSSID, s_ssid.c_str(), sizeof(wifiSSID) - 1);
-            wifiSSID[sizeof(wifiSSID) - 1] = '\0';
-            
-            strncpy(wifiPassword, s_pass.c_str(), sizeof(wifiPassword) - 1);
-            wifiPassword[sizeof(wifiPassword) - 1] = '\0';
-            
-            // Save to Preferences
-            prefs.begin("network", false);
-            prefs.putString("wifi_ssid", wifiSSID);
-            prefs.putString("wifi_pass", wifiPassword);
-            prefs.end();
-            
-            Serial.println(F(">> STATUS: ✓ WiFi credentials saved!"));
-            Serial.print(F(">> SSID: "));
-            Serial.println(wifiSSID);
-            
-            // Try to connect
-            connectToWiFi();
-        } else {
-            Serial.println(F(">> STATUS: ✗ INVALID FORMAT"));
-            Serial.println(F(">> ERROR: Missing SSID or password"));
-            Serial.println(F(">> USAGE: SET_WIFI <ssid> <password>"));
-            Serial.println(F(">> EXAMPLE: SET_WIFI MyWiFi MyPassword123"));
-        }
-    }
-    
-    // Command: SET_API <base_url>
-    else if (input.startsWith("SET_API ")) {
-        Serial.println(F(">> COMMAND: SET_API"));
-        
-        String s_url = input.substring(8);
-        s_url.trim();
-        
-        // Remove trailing slash if present
-        if (s_url.endsWith("/")) {
-            s_url = s_url.substring(0, s_url.length() - 1);
-        }
-        
-        strncpy(apiBaseURL, s_url.c_str(), sizeof(apiBaseURL) - 1);
-        apiBaseURL[sizeof(apiBaseURL) - 1] = '\0';
-        
-        // Save to Preferences
-        prefs.begin("network", false);
-        prefs.putString("api_url", apiBaseURL);
-        prefs.end();
-        
-        Serial.println(F(">> STATUS: ✓ API URL saved!"));
-        Serial.print(F(">> URL: "));
-        Serial.println(apiBaseURL);
-        
-        // Perform health check if WiFi is connected
-        if (wifiConnected) {
-            checkAPIHealth();
-        } else {
-            Serial.println(F(">> INFO: Connect WiFi first to check API health"));
-        }
-    }
-    
-    
-    // --- LEGACY: FILE MANAGEMENT COMMANDS (Commented for HTTP API mode) ---
-    /*
     // Command: ls
     else if (input.equalsIgnoreCase("ls")) {
         if (sdReady) {
             listDir(SD, "/", 0);
         } else {
-            Serial.println(F("\u003e\u003e Error: SD Card not ready"));
+            Serial.println(F(">> Error: SD Card not ready"));
         }
     }
     // Command: remove_all
@@ -2348,7 +1976,7 @@ void processSerial(String input) {
         if (sdReady) {
             deleteAllFiles(SD);
         } else {
-            Serial.println(F("\u003e\u003e Error: SD Card not ready"));
+            Serial.println(F(">> Error: SD Card not ready"));
         }
     }
     // Command: remove <filename>
@@ -2361,46 +1989,30 @@ void processSerial(String input) {
             // Show list after delete
             listDir(SD, "/", 0);
         } else {
-            Serial.println(F("\u003e\u003e Error: SD Card not ready"));
+            Serial.println(F(">> Error: SD Card not ready"));
         }
     }
-    */
-    
     // Command: status
     else if (input.equalsIgnoreCase("status")) {
-        Serial.println(F("\u003e\u003e SYSTEM STATUS:"));
-        Serial.printf("   Device ID: %s\n", deviceId.c_str());
-        Serial.printf("   WiFi: %s\n", wifiConnected ? "CONNECTED" : "DISCONNECTED");
-        if (wifiConnected) {
-            Serial.printf("   WiFi SSID: %s\n", wifiSSID);
-            Serial.printf("   WiFi RSSI: %d dBm\n", wifiRSSI);
-            Serial.print("   IP: ");
-            Serial.println(WiFi.localIP());
-        }
-        Serial.printf("   API URL: %s\n", strlen(apiBaseURL) > 0 ? apiBaseURL : "NOT SET");
-        Serial.printf("   HTTP Status: %s (%d)\n", lastHTTPStatus.c_str(), lastHTTPCode);
+        Serial.println(F(">> SYSTEM STATUS:"));
+        Serial.printf("   SD Card: %s\n", sdReady ? "READY" : "ERROR/MISSING");
         Serial.printf("   RTC: %s\n", rtcReady ? "READY" : "ERROR");
         Serial.printf("   Logging: %s\n", isLogging ? "ACTIVE" : "STOPPED");
-        if (isLogging) {
-            Serial.printf("   Iterations: %lu\n", logIteration);
-        }
         Serial.printf("   Calibrated: %s\n", system_calibrated ? "YES" : "NO");
         Serial.printf("   Uptime: %lu s\n", sysData.uptime_sec);
     }
     // Command: help
     else if (input.equalsIgnoreCase("help") || input.equalsIgnoreCase("?")) {
-        Serial.println(F("\u003e\u003e AVAILABLE COMMANDS:"));
-        Serial.println(F("   === NETWORK ==="));
-        Serial.println(F("   SET_WIFI <ssid> <pass> : Configure WiFi"));
-        Serial.println(F("   SET_API <url>          : Set API endpoint"));
-        Serial.println(F("   status                 : Show system status"));
-        Serial.println(F("   === CALIBRATION ==="));
-        Serial.println(F("   reset_all              : Reset calibration"));
-        Serial.println(F("   auto                   : Auto calibrate current"));
-        Serial.println(F("   v<voltage>             : Add voltage point (e.g. v12.5)"));
-        Serial.println(F("   SET_TIME YYYY MM DD HH MM SS"));
-        Serial.println(F("   === HELP ==="));
-        Serial.println(F("   help                   : Show this list"));
+        Serial.println(F(">> AVAILABLE COMMANDS:"));
+        Serial.println(F("   ls             : List files on SD card"));
+        Serial.println(F("   remove <file>  : Delete specific file"));
+        Serial.println(F("   remove_all     : Delete ALL files"));
+        Serial.println(F("   status         : Show system status"));
+        Serial.println(F("   reset_all      : Reset calibration"));
+        Serial.println(F("   auto           : Auto calibrate current"));
+        Serial.println(F("   v<voltage>     : Add voltage point (e.g. v12.5)"));
+        Serial.println(F("   SET_TIME ...   : Set RTC time"));
+        Serial.println(F("   help           : Show this list"));
     }
     else {
         // Unknown command
@@ -2508,9 +2120,8 @@ void drawCalibrationScreen() {
     // Calibration items
     curY += drawItem(curY, 1, "Kalibrasi Arus", "Pastikan 0A, ketik 'auto'", calib_curr_done);
     
-    bool voltDone = (calib_volt_count >= MIN_CAL_POINTS);
-    String voltMsg = "Input " + String(MIN_CAL_POINTS) + "x: 'v12.5' dst";
-    curY += drawItem(curY, 2, "Kalibrasi Volt", voltMsg, voltDone, calib_volt_count);
+    bool voltDone = (calib_volt_count >= 3);
+    curY += drawItem(curY, 2, "Kalibrasi Volt", "Input 3x: 'v12.5' dst", voltDone, calib_volt_count);
     
     curY += drawItem(curY, 3, "Setup Waktu", "Ketik 'SET_TIME...'", calib_rtc_done);
     
@@ -2575,25 +2186,15 @@ void dataTask(void *parameter) {
     sysData.time_start = startTime;
     sysData.i_used_min = 999;
     
-    TickType_t xLastWakeTime = xTaskGetTickCount();
-    const TickType_t xFrequency = pdMS_TO_TICKS(10); // 10ms precise interval
-    
     for (;;) {
         // Read voltage
         float rawBattery = getMedianADC(batteryPin, 15);
-        float v_final = 0;
         
         if (sensorSystemValid) {
-            v_final = getInterpolatedVoltage(rawBattery);
+            sysData.voltage = getInterpolatedVoltage(rawBattery);
         } else {
             float v_adc = (rawBattery / ADC_resolution) * V_ref;
-            v_final = v_adc * 11.0;
-        }
-        
-        // Protect sysData write
-        if (xSemaphoreTake(sysDataMutex, portMAX_DELAY) == pdTRUE) {
-            sysData.voltage = v_final;
-            xSemaphoreGive(sysDataMutex);
+            sysData.voltage = v_adc * 11.0;
         }
         
         // Apply smoothing for display (reduce decimal flickering from noise)
@@ -2613,44 +2214,34 @@ void dataTask(void *parameter) {
         
         // Apply dead zone
         if (abs(I_raw) < 0.15) I_raw = 0.0;
-        // Read voltage safely for deadzone check
-        float currentVoltage = 0;
-        if (xSemaphoreTake(sysDataMutex, portMAX_DELAY) == pdTRUE) {
-             currentVoltage = sysData.voltage;
-             xSemaphoreGive(sysDataMutex);
-        }
-        if (currentVoltage < 3.0) I_raw = 0.0;
+        if (sysData.voltage < 3.0) I_raw = 0.0;
         
         // Separate into used and regen current
-        // Protect sysData writes
-        if (xSemaphoreTake(sysDataMutex, portMAX_DELAY) == pdTRUE) {
-            if (I_raw >= 0) {
-                sysData.i_used = I_raw;
-                sysData.i_regen = 0;
-            } else {
-                sysData.i_used = 0;
-                sysData.i_regen = abs(I_raw);
-            }
-            
-            // Track max/min current
-            if (sysData.i_used > sysData.i_used_max) {
-                sysData.i_used_max = sysData.i_used;
-            }
-            
-            if (sysData.i_used < sysData.i_used_min && sysData.i_used > 0) {
-                sysData.i_used_min = sysData.i_used;
-            }
-            
-            // Calculate average current (exponential moving average)
-            static float alpha = 0.1;  // Smoothing factor
-            static bool avgInitialized = false;
-            if (!avgInitialized && sysData.i_used > 0) {
-                sysData.i_used_avg = sysData.i_used;
-                avgInitialized = true;
-            } else if (sysData.i_used > 0) {
-                sysData.i_used_avg = (alpha * sysData.i_used) + ((1.0 - alpha) * sysData.i_used_avg);
-            }
-            xSemaphoreGive(sysDataMutex);
+        if (I_raw >= 0) {
+            sysData.i_used = I_raw;
+            sysData.i_regen = 0;
+        } else {
+            sysData.i_used = 0;
+            sysData.i_regen = abs(I_raw);
+        }
+        
+        // Track max/min current
+        if (sysData.i_used > sysData.i_used_max) {
+            sysData.i_used_max = sysData.i_used;
+        }
+        
+        if (sysData.i_used < sysData.i_used_min && sysData.i_used > 0) {
+            sysData.i_used_min = sysData.i_used;
+        }
+        
+        // Calculate average current (exponential moving average)
+        static float alpha = 0.1;  // Smoothing factor
+        static bool avgInitialized = false;
+        if (!avgInitialized && sysData.i_used > 0) {
+            sysData.i_used_avg = sysData.i_used;
+            avgInitialized = true;
+        } else if (sysData.i_used > 0) {
+            sysData.i_used_avg = (alpha * sysData.i_used) + ((1.0 - alpha) * sysData.i_used_avg);
         }
         
         // Calculate energy (Wh)
@@ -2659,55 +2250,34 @@ void dataTask(void *parameter) {
         
         if (now - lastWh > 100) {
             float hours = (now - lastWh) / 3600000.0;
-            if (xSemaphoreTake(sysDataMutex, portMAX_DELAY) == pdTRUE) {
-                sysData.wh_used += (sysData.voltage * sysData.i_used * hours);
-                sysData.wh_regen += (sysData.voltage * sysData.i_regen * hours);
-                
-                // Calculate efficiency
-                if (sysData.wh_used > 0.001) {
-                    sysData.efficiency = (sysData.wh_regen / sysData.wh_used) * 100.0;
-                } else {
-                    sysData.efficiency = 0;
-                }
-                
-                if (sysData.efficiency > 100.0) {
-                    sysData.efficiency = 100.0;
-                }
-                xSemaphoreGive(sysDataMutex);
-            }
+            sysData.wh_used += (sysData.voltage * sysData.i_used * hours);
+            sysData.wh_regen += (sysData.voltage * sysData.i_regen * hours);
             lastWh = now;
+        }
+        
+        // Calculate efficiency
+        if (sysData.wh_used > 0.001) {
+            sysData.efficiency = (sysData.wh_regen / sysData.wh_used) * 100.0;
         } else {
-             // Ensure efficiency is calculated even if Wh not updated every loop
-             if (xSemaphoreTake(sysDataMutex, portMAX_DELAY) == pdTRUE) {
-                if (sysData.wh_used > 0.001) {
-                    sysData.efficiency = (sysData.wh_regen / sysData.wh_used) * 100.0;
-                } else {
-                    sysData.efficiency = 0;
-                }
-                if (sysData.efficiency > 100.0) sysData.efficiency = 100.0;
-                xSemaphoreGive(sysDataMutex);
-             }
+            sysData.efficiency = 0;
+        }
+        
+        if (sysData.efficiency > 100.0) {
+            sysData.efficiency = 100.0;
         }
         
         // Update time
-        if (xSemaphoreTake(sysDataMutex, portMAX_DELAY) == pdTRUE) {
-            sysData.uptime_sec = (now - startTime) / 1000;
-            
-            if (rtcReady) {
-                if (xSemaphoreTake(i2cMutex, 10) == pdTRUE) { // Short timeout for I2C
-                    sysData.time_now = rtc.now().unixtime() * 1000;
-                    xSemaphoreGive(i2cMutex);
-                }
-            } else {
-                sysData.time_now = now;
-            }
-            
-            sysData.iteration++;
-            xSemaphoreGive(sysDataMutex);
+        sysData.uptime_sec = (now - startTime) / 1000;
+        
+        if (rtcReady) {
+            sysData.time_now = rtc.now().unixtime() * 1000;
+        } else {
+            sysData.time_now = now;
         }
         
-        // Precise delay for consistent 100Hz sampling
-        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+        sysData.iteration++;
+        
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
@@ -2737,14 +2307,63 @@ unsigned long lastSDWrite = 0;
 unsigned long lastSDCheck = 0; // For hot-swap detection
 
 // Check SD card status (Hot-swap detection)
-// LEGACY: SD Card Status Check (Commented out)
-/*
 void checkSDCardStatus() {
-    // Legacy code removed/commented
-}
-*/
-void checkSDCardStatus() {
-    // No-op for HTTP API mode
+    // Check frequently (every 250ms) for responsiveness
+    if (millis() - lastSDCheck < 250) return;
+    lastSDCheck = millis();
+
+    bool detected = false;
+    
+    // 1. Cek status fisik/logis
+    if (sdReady) {
+        // Jika sistem mengira SD ada, verifikasi apakah masih merespon
+        if (SD.cardType() == CARD_NONE) {
+            detected = false;
+        } else {
+            detected = true;
+        }
+    } else {
+        // Jika sistem mengira SD tidak ada, coba inisialisasi ulang
+        SD.end(); // Bersihkan state sebelumnya (PENTING!)
+        if (SD.begin(SD_CS_PIN, sdSPI, 1000000)) {
+            // Double check dengan cardType
+            if (SD.cardType() != CARD_NONE) {
+                detected = true;
+            }
+        }
+    }
+    
+    // 2. Handle State Transitions
+    if (!detected) {
+        // Case 1: SD Card Removed / Error
+        // Trigger jika sebelumnya ready ATAU jika error belum ditampilkan
+        if (sdReady || !sdErrorOccurred) {
+            sdReady = false;
+            sdErrorOccurred = true;
+            sdErrorCode = "E-01";
+            sdErrorMsg = "SD Dicabut";
+            
+            // Show Error UI immediately
+            drawSDError(sdErrorCode, sdErrorMsg);
+        }
+    } 
+    else {
+        // Case 2: SD Card Present (Recovery)
+        if (!sdReady) { // Was missing, now found
+            sdReady = true;
+            sdErrorOccurred = false;
+            
+            // Show Success UI
+            float cardSize = SD.cardSize() / (1024.0 * 1024.0 * 1024.0);
+            drawSDSuccess(cardSize, "FAT32");
+            delay(2000); // Show success for 2s
+            
+            // Restore slide
+            if (currentSlide == 1) slide1.refresh();
+            else if (currentSlide == 2) slide2.refresh();
+            else if (currentSlide == 3) slide3.refresh();
+        }
+    }
 }
 
 void setup() {
@@ -2764,62 +2383,14 @@ void setup() {
     
     // ========================================================
     // PRIORITY #2: Serial and other initialization
+    // ========================================================
     // Now that screen is black, we can do slower init tasks
     Serial.begin(115200);
     delay(500);  // Wait for serial and power stabilization
     
     Serial.println(F("\n========================================"));
-    Serial.println(F("  INDUSTRIAL POWER MONITOR v3.0"));
-    Serial.println(F("  HTTP API Mode"));
+    Serial.println(F("  INDUSTRIAL POWER MONITOR v2.0"));
     Serial.println(F("========================================\n"));
-    
-    // Generate unique deviceId from MAC address
-    WiFi.mode(WIFI_STA);
-    delay(100); // Wait for MAC to be ready
-    
-    // Retry getting MAC if needed
-    String mac = WiFi.macAddress();
-    int retry = 0;
-    while (mac == "00:00:00:00:00:00" && retry < 5) {
-        delay(100);
-        mac = WiFi.macAddress();
-        retry++;
-    }
-    
-    deviceId = "esp32-" + mac;
-    Serial.print(F(">> Device ID: "));
-    Serial.println(deviceId);
-    
-    // Load network configuration from Preferences
-    prefs.begin("network", true); // Read-only
-    String s_ssid = prefs.getString("wifi_ssid", "");
-    String s_pass = prefs.getString("wifi_pass", "");
-    String s_url = prefs.getString("api_url", "");
-    
-    // Copy to char arrays
-    strncpy(wifiSSID, s_ssid.c_str(), sizeof(wifiSSID) - 1);
-    wifiSSID[sizeof(wifiSSID) - 1] = '\0';
-    
-    strncpy(wifiPassword, s_pass.c_str(), sizeof(wifiPassword) - 1);
-    wifiPassword[sizeof(wifiPassword) - 1] = '\0';
-    
-    strncpy(apiBaseURL, s_url.c_str(), sizeof(apiBaseURL) - 1);
-    apiBaseURL[sizeof(apiBaseURL) - 1] = '\0';
-    
-    prefs.end();
-    
-    if (strlen(wifiSSID) > 0) {
-        Serial.println(F(">> Network config loaded from EEPROM"));
-        connectToWiFi();
-        
-        if (wifiConnected && strlen(apiBaseURL) > 0) {
-            checkAPIHealth();
-        }
-    } else {
-        Serial.println(F(">> No WiFi config found"));
-        Serial.println(F(">> Use: SET_WIFI <ssid> <password>"));
-        Serial.println(F(">> Use: SET_API <url>"));
-    }
     
     // I2C for RTC
     Wire.begin();
@@ -2832,9 +2403,9 @@ void setup() {
         rtcReady = true;
     }
     
-    // LEGACY: SD card initialization (commented for HTTP API mode)
-    // delay(200);
-    // initSDCard();
+    // SD card initialization (with power-on delay)
+    delay(200);  // Additional delay for SD card power-on
+    initSDCard();
     
     // Load calibration preferences
     prefs.begin("calib_ui", false);
@@ -2843,7 +2414,6 @@ void setup() {
     calib_curr_done = prefs.getBool("c_curr", false);
     calib_volt_count = prefs.getInt("c_volt_n", 0);
     calib_rtc_done = prefs.getBool("c_rtc", false);
-    prefs.end();
     
     I_offset = calPrefs.getFloat("i_off", I_offset);
     
@@ -2854,10 +2424,11 @@ void setup() {
     
     // Print startup status
     Serial.println(F(">> SYSTEM READY"));
+    Serial.printf(">> SD Status: %s\n", sdReady ? "READY" : "MISSING/ERROR");
     Serial.println(F(">> Type 'help' for available commands"));
     
     // Check if system is calibrated
-    if (calib_curr_done && calib_volt_count >= MIN_CAL_POINTS && calib_rtc_done) {
+    if (calib_curr_done && calib_volt_count >= 3 && calib_rtc_done) {
         system_calibrated = true;
         chartsInitialized = true;
         slide1.begin(200, 130, s1_voltage, s1_regen, s1_used);
@@ -2865,32 +2436,21 @@ void setup() {
         drawCalibrationScreen();
     }
     
-    // Initialize Logging Queue
-    // Initialize Logging Queue
-    logQueue = xQueueCreate(50, sizeof(LogItem)); // Increased buffer to 50 items
-    
-    // Initialize Mutexes
-    sysDataMutex = xSemaphoreCreateMutex();
-    i2cMutex = xSemaphoreCreateMutex();
-    
-    // Start logging task on Core 0 (Low Priority)
-    // Increased stack to 12KB for safe HTTPS SSL handshake
-    xTaskCreatePinnedToCore(loggingTask, "LogTask", 12288, NULL, 0, NULL, 0);
-
-    // Start data acquisition task on Core 0 (High Priority)
-    // Increased stack to 10KB for safety
-    xTaskCreatePinnedToCore(dataTask, "DataTask", 10240, NULL, 1, NULL, 0);
+    // Start data acquisition task on Core 0
+    xTaskCreatePinnedToCore(dataTask, "DataTask", 8192, NULL, 1, NULL, 0);
 }
 
 void loop() {
-    // LEGACY: Check for SD errors (Commented for HTTP API mode)
-    /*
+    // PRIORITY: Check for SD errors and display immediately
     if (sdErrorOccurred) {
+        // Only auto-clear transient errors (NOT E-01 "SD Dicabut")
+        // E-01 is persistent until checkSDCardStatus detects recovery
         if (sdErrorCode != "E-01") {
             drawSDError(sdErrorCode, sdErrorMsg);
             delay(2000);
-            sdErrorOccurred = false; 
+            sdErrorOccurred = false; // Clear flag for transient errors
             
+            // Restore slide
             if (system_calibrated && chartsInitialized) {
                 if (currentSlide == 1) slide1.refresh();
                 else if (currentSlide == 2) slide2.refresh();
@@ -2898,7 +2458,6 @@ void loop() {
             }
         }
     }
-    */
     
     // Process serial commands
     if (Serial.available()) {
@@ -2970,15 +2529,12 @@ void loop() {
         return;
     }
     
-    // NETWORK: Ensure WiFi is connected
-    ensureWiFiConnected();
-    
-    // LEGACY: SD card data logging (Commented for HTTP API mode)
-    /*
+    // SD card data logging (Check every 200ms for faster error detection)
     if (isLogging && sdReady && (millis() - lastSDWrite > 200)) {
         lastSDWrite = millis();
         
         if (currentLogFile) {
+            // Try to write data
             size_t written = currentLogFile.printf("%lu,%.2f,%.2f,%.2f,%.4f,%.4f,%lu\n",
                 ++logIteration,
                 sysData.voltage,
@@ -2988,12 +2544,15 @@ void loop() {
                 sysData.wh_regen,
                 sysData.time_now);
             
+            // Check if write was successful
             if (written == 0) {
+                // Write failed - set error flag for immediate display
                 Serial.println(">> Error: File write failed during logging");
                 currentLogFile.close();
                 isLogging = false;
                 sdReady = false;
                 
+                // Set flag for priority display in next loop iteration
                 sdErrorOccurred = true;
                 sdErrorCode = "E-03";
                 sdErrorMsg = "Save Error";
@@ -3002,9 +2561,11 @@ void loop() {
                     currentLogFile.flush();
                 }
                 
+                // Blink LED indicator
                 digitalWrite(LED_PIN, !digitalRead(LED_PIN));
             }
         } else {
+            // File is not open but logging is active - error state
             Serial.println(">> Error: Log file not available");
             isLogging = false;
             sdReady = false;
@@ -3012,133 +2573,59 @@ void loop() {
             sdErrorMsg = "File Lost";
         }
     } else {
+        // Monitor SD card hot-swap when not logging
         checkSDCardStatus();
-    */
-    
-    // HTTP API Data Transmission
-    // HTTP API Data Transmission (Async)
-    if (isLogging && wifiConnected && (millis() - lastAPIRequest >= API_REQUEST_INTERVAL)) {
         
-        LogItem item;
-        
-        // Atomic read of sysData
-        if (xSemaphoreTake(sysDataMutex, portMAX_DELAY) == pdTRUE) {
-            item.voltage = sysData.voltage;
-            item.i_used = sysData.i_used;
-            item.i_regen = sysData.i_regen;
-            item.wh_used = sysData.wh_used;
-            item.wh_regen = sysData.wh_regen;
-            xSemaphoreGive(sysDataMutex);
-        }
-        
-        // Safe string copy for Queue
-        strncpy(item.deviceId, deviceId.c_str(), sizeof(item.deviceId) - 1);
-        item.deviceId[sizeof(item.deviceId) - 1] = '\0';
-        
-        if (rtcReady) {
-            if (xSemaphoreTake(i2cMutex, 10) == pdTRUE) {
-                item.timestamp = rtc.now().unixtime();
-                xSemaphoreGive(i2cMutex);
-            } else {
-                item.timestamp = millis() / 1000; // Fallback if I2C busy
-            }
-        } else {
-            item.timestamp = millis() / 1000;
-        }
-        
-        // Send to queue (non-blocking)
-        if (xQueueSend(logQueue, &item, 0) == pdTRUE) {
-            logIteration++; 
-        } else {
-            static unsigned long lastQueueWarn = 0;
-            if (millis() - lastQueueWarn > 5000) {
-                Serial.println(F(">> WARN: Log Queue Full (dropping data)"));
-                lastQueueWarn = millis();
-            }
-        }
-        
-        // ALWAYS update timestamp to prevent retry storm
-        // If queue is full, we drop the data and wait for next interval
-        lastAPIRequest = millis();
-    }
-    
-    // Slide Auto-Change Logic (Moved out of else block)
-    if (chartsInitialized) {
-        // Auto slide change (every 5 seconds)
-        if (millis() - lastSlideChange > 5000) {
-            lastSlideChange = millis();
-            
-            // End current slide
-            if (currentSlide == 1) {
-                slide1.end();
-            } else if (currentSlide == 2) {
-                slide2.end();
-            } else if (currentSlide == 3) {
-                slide3.end();
-            } else if (currentSlide == 4) {
-                slide4.end();
-                showFileInfoSlide = false;  // Only show once
-            }
-            
-            // Next slide
-            currentSlide++;
-            
-            // Skip slide 4 unless flag is set
-            if (currentSlide == 4 && !showFileInfoSlide) {
-                currentSlide = 1;
-            }
-            
-            if (currentSlide > 4) currentSlide = 1;
-            
-            // Begin new slide
-            if (currentSlide == 1) {
-                slide1.begin(200, 130, s1_voltage, s1_regen, s1_used);
-            } else if (currentSlide == 2) {
-                slide2.begin(200, 130, s2_voltage, s2_energyUsed, s2_energyRegen);
-            } else if (currentSlide == 3) {
-                slide3.begin();
-            } else if (currentSlide == 4) {
-                slide4.begin();
+        // Only run slide auto-change if charts are initialized
+        if (chartsInitialized) {
+            // Auto slide change (every 5 seconds)
+            if (millis() - lastSlideChange > 5000) {
+                lastSlideChange = millis();
+                
+                // End current slide
+                if (currentSlide == 1) {
+                    slide1.end();
+                } else if (currentSlide == 2) {
+                    slide2.end();
+                } else if (currentSlide == 3) {
+                    slide3.end();
+                } else if (currentSlide == 4) {
+                    slide4.end();
+                    showFileInfoSlide = false;  // Only show once
+                }
+                
+                // Next slide
+                currentSlide++;
+                
+                // Skip slide 4 unless flag is set
+                if (currentSlide == 4 && !showFileInfoSlide) {
+                    currentSlide = 1;
+                }
+                
+                if (currentSlide > 4) currentSlide = 1;
+                
+                // Begin new slide
+                if (currentSlide == 1) {
+                    slide1.begin(200, 130, s1_voltage, s1_regen, s1_used);
+                } else if (currentSlide == 2) {
+                    slide2.begin(200, 130, s2_voltage, s2_energyUsed, s2_energyRegen);
+                } else if (currentSlide == 3) {
+                    slide3.begin();
+                } else if (currentSlide == 4) {
+                    slide4.begin();
+                }
             }
         }
     }
-    // } // End of commented else block
-
     
     // Update current slide ONLY if no SD error is blocking the view
     if (!sdErrorOccurred) {
         if (currentSlide == 1) {
-            // Use local copy or atomic read? 
-            // For display, we can just grab the values. But better to be consistent.
-            float d_volt, d_regen, d_used;
-            if (xSemaphoreTake(sysDataMutex, 10) == pdTRUE) {
-                d_regen = sysData.i_regen;
-                d_used = sysData.i_used;
-                xSemaphoreGive(sysDataMutex);
-                // displayVoltage is local to loop/global but only written in dataTask? 
-                // Wait, displayVoltage is written in dataTask! It needs protection too or move it to sysData.
-                // Actually displayVoltage is global. Let's protect it or just read it. 
-                // It's a float, atomic on 32-bit? Not guaranteed.
-                // Let's just use the values we got.
-                slide1.update(displayVoltage, d_regen, d_used); 
-            }
+            slide1.update(displayVoltage, sysData.i_regen, sysData.i_used);
         } else if (currentSlide == 2) {
-            float d_wh_used, d_wh_regen, d_eff;
-             if (xSemaphoreTake(sysDataMutex, 10) == pdTRUE) {
-                d_wh_used = sysData.wh_used;
-                d_wh_regen = sysData.wh_regen;
-                d_eff = sysData.efficiency;
-                xSemaphoreGive(sysDataMutex);
-                slide2.update(displayVoltage, d_wh_used, d_wh_regen, d_eff);
-             }
+            slide2.update(displayVoltage, sysData.wh_used, sysData.wh_regen, sysData.efficiency);
         } else if (currentSlide == 3) {
-            SystemData tempSys;
-            if (xSemaphoreTake(sysDataMutex, 10) == pdTRUE) {
-                // Cast away volatile for copy (safe due to Mutex)
-                memcpy(&tempSys, (const void*)&sysData, sizeof(SystemData));
-                xSemaphoreGive(sysDataMutex);
-                slide3.update(tempSys);
-            }
+            slide3.update(sysData);
             delay(100);
         } else if (currentSlide == 4) {
             slide4.update();
