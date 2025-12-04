@@ -43,9 +43,16 @@ const int batteryPin = 39;
 // ============================================================================
 // SENSOR PARAMETERS
 // ============================================================================
-float I_offset = 2.2871;
+// --- PREVIOUS TUNING (Commented as requested) ---
+// float I_offset = 0.9035; // Calculated from Vout_zero * Divider (2.534 * 0.3565)
+// float I_sensitivity = 0.020;
+// float I_divider_factor = 0.3565; // R2 / (R1 + R2) = 3.258 / (5.880 + 3.258)
+
+// --- NEW ROBUST TUNING (Smart Filtering) ---
+float I_offset = 0.9035; // Keep same offset base
 float I_sensitivity = 0.020;
-float I_divider_factor = 0.6667;
+float I_divider_factor = 0.3565; 
+// Note: We will use smart software filtering instead of hardware tuning for now
 float I_scale_factor = 1.1948;
 const float V_ref = 3.342;
 const float ADC_resolution = 4095.0;
@@ -53,7 +60,7 @@ const float ADC_resolution = 4095.0;
 // ============================================================================
 // CALIBRATION SETTINGS
 // ============================================================================
-#define MAX_CAL_POINTS 12 // init value: 6
+#define MAX_CAL_POINTS 10 // init value: 6
 #define MIN_CAL_POINTS 6  // init value: 3
 
 struct CalPoint {
@@ -66,35 +73,35 @@ struct CalPoint {
 // ============================================================================
 // Housing 3D Colors
 #define C_HOUSING_FRONT 0x4208
-#define C_HOUSING_SIDE 0x2104
-#define C_POLE 0xBDF7
-#define C_POLE_SHADE 0x7BEF
+#define C_HOUSING_SIDE  0x2104
+#define C_POLE          0xBDF7
+#define C_POLE_SHADE    0x7BEF
 
 // Traffic Light Colors
-#define TL_RED_ON TFT_BLUE
-#define TL_YELLOW_ON TFT_CYAN
-#define TL_GREEN_ON TFT_GREEN
-#define TL_RED_DIM 0x0008
-#define TL_YELLOW_DIM 0x01E0
-#define TL_GREEN_DIM 0x0100
+#define TL_RED_ON       TFT_BLUE
+#define TL_YELLOW_ON    TFT_CYAN
+#define TL_GREEN_ON     TFT_GREEN
+#define TL_RED_DIM      0x0008
+#define TL_YELLOW_DIM   0x01E0
+#define TL_GREEN_DIM    0x0100
 
 // Display Colors
-#define COLOR_BLUE TFT_RED
-#define COLOR_CYAN TFT_YELLOW
-#define COLOR_GREEN TFT_GREEN
-#define COLOR_RED TFT_BLUE
-#define COLOR_TEXT_L 0xBDF7
-#define COLOR_TEXT_V TFT_WHITE
-#define COLOR_BG TFT_BLACK
-#define COLOR_GRID 0x02E0
-#define TFT_GREY 0x5AEB
-#define TFT_ORANGE 0xFD20
+#define COLOR_BLUE      TFT_RED
+#define COLOR_CYAN      TFT_YELLOW
+#define COLOR_GREEN     TFT_GREEN
+#define COLOR_RED       TFT_BLUE
+#define COLOR_TEXT_L    0xBDF7
+#define COLOR_TEXT_V    TFT_WHITE
+#define COLOR_BG        TFT_BLACK
+#define COLOR_GRID      0x02E0
+#define TFT_GREY        0x5AEB
+#define TFT_ORANGE      0xFD20
 
 // Calibration Colors
-#define CALIB_COLOR_WARN TFT_RED
-#define CALIB_COLOR_DONE TFT_GREEN
+#define CALIB_COLOR_WARN    TFT_RED
+#define CALIB_COLOR_DONE    TFT_GREEN
 #define CALIB_COLOR_PENDING TFT_WHITE
-#define CALIB_COLOR_DIM 0x528A
+#define CALIB_COLOR_DIM     0x528A
 
 // New UI Colors (v2.1)
 #define C_SD_BODY     0x3186 // Dark Grey
@@ -108,6 +115,17 @@ struct CalPoint {
 #define C_CARD_BG     0x2124 // Card Background
 #define C_CARD_SHADOW 0x1082 // Card Shadow
 #define C_BG_MAIN     TFT_BLACK
+
+// --- DEFINISI WARNA (Pastikan ini ada di header/global) ---
+#define C_CARD_FACE   0x2124 // Dark Gray Body
+#define C_CARD_SHADOW 0x10A2 // Deep Shadow
+#define C_ACCENT_LOAD C_POLE // Abu terang untuk loading
+#define C_STATUS_OK   COLOR_GREEN // Hijau Vibrant
+#define C_STATUS_FAIL 0xF965 // Merah Apple
+
+#define C_PLANE_BODY  TFT_WHITE
+#define C_PLANE_SHADE 0xBDF7
+#define C_TRAIL       0x632C
 
 // ============================================================================
 // DATA STRUCTURES
@@ -144,6 +162,159 @@ struct ProductConfig {
 enum Theme { CLASSIC = 1, MODERN = 0 };
 enum WaveMode { SINE, SQUARE, TRIANGLE, SAWTOOTH, NOISE };
 
+/*
+ * Industrial Grade Adaptive Kalman Filter
+ * Based on concepts from: "Extended Kalman Filter with Reduced Computational Demands..."
+ * Features:
+ * 1. Oversampling & Decimation (Virtual Resolution Increase).
+ * 2. Adaptive Computation (Threshold-based updates).
+ * 3. Robust handling for BLDC noise (Process Noise injection).
+ */
+class IndustrialKalman {
+  private:
+    // State variables
+    float _est_value; // Estimate value (Arus)
+    float _err_cov; // Error Covariance
+    float _process_noise; // Process Noise Covariance (Kepercayaan terhadap model)
+    float _meas_noise; // Measurement Noise Covariance (Kepercayaan terhadap sensor)
+    float _kalman_gain; // Kalman Gain
+
+    // Oversampling settings
+    int _oversample_bits;
+    int _n_samples;
+
+    // Adaptive Threshold from Paper (rho)
+    float _rho; 
+    
+    // System Dynamics
+    float _last_prediction;
+
+  public:
+    // Constructor
+    // process_noise: Seberapa cepat arus berubah (Motor = tinggi, Baterai = rendah)
+    // measure_noise: Noise sensor ACS758 (lihat datasheet/pengukuran)
+    // rho: Threshold adaptif (lihat Table 1 di jurnal)
+    IndustrialKalman(float process_noise, float measure_noise, float rho) {
+      _process_noise = process_noise;
+      _meas_noise = measure_noise;
+      _err_cov = 1.0;
+      _est_value = 0.0;
+      _rho = rho; 
+      
+      // Setup Oversampling 
+      // 4^n samples = n bits extra resolution. 
+      // 64 samples = 4^3 -> +3 bits extra precision.
+      _n_samples = 64; 
+    }
+
+    // Fungsi Utama: Oversampling + Decimation + Adaptive Kalman
+    float update(int pin) {
+      // --- TAHAP 1: OVERSAMPLING & DECIMATION ---
+      // Meningkatkan Signal-to-Noise Ratio (SNR) sebelum masuk filter
+      long sum = 0;
+      for (int i = 0; i < _n_samples; i++) {
+        sum += analogRead(pin);
+        // Delay mikro sangat kecil agar menangkap PWM noise dari BLDC
+        delayMicroseconds(10); 
+      }
+      
+      // Decimation (Rata-rata)
+      float z_k = (float)sum / _n_samples;
+
+      // --- TAHAP 2: PREDICTION (Time Update) ---
+      // x(k|k-1) = x(k-1|k-1) (Asumsi arus konstan dalam dt kecil)
+      float x_pred = _est_value;
+      // P(k|k-1) = P(k-1|k-1) + Q
+      float P_pred = _err_cov + _process_noise;
+
+      // --- TAHAP 3: ADAPTIVE UPDATE LOGIC (Inspired by Paper) ---
+      // Hitung "Monitoring Variable" (Inovasi)
+      // Jurnal Eq. 7 & 15: Membandingkan perubahan dengan threshold
+      float innovation = z_k - x_pred;
+      
+      // Jika perubahan sangat kecil (steady state/noise idle),
+      // kita skip update kovariansi berat untuk menghemat komputasi & menstabilkan nilai 0A.
+      // Ini mengadopsi konsep "reduced computational demands".
+      if (abs(innovation) < _rho) {
+        // Mode Hemat / Stabil:
+        // Hanya update estimate sedikit (seperti Low Pass Filter sederhana)
+        // Tidak update matriks P yang berat.
+        // Gain diperkecil ke 0.001 untuk noise suppression maksimal saat idle
+        _est_value = x_pred + 0.001 * innovation; 
+      } 
+      else {
+        // Mode Responsif (Full Kalman Update):
+        // Terjadi jika ada lonjakan arus BLDC (Transient)
+        
+        // Hitung Kalman Gain
+        _kalman_gain = P_pred / (P_pred + _meas_noise);
+        
+        // Update State Estimate
+        _est_value = x_pred + _kalman_gain * innovation;
+        
+        // Update Error Covariance
+        _err_cov = (1.0 - _kalman_gain) * P_pred;
+      }
+
+      return _est_value; // Kembalikan nilai RAW ADC yang sudah difilter
+    }
+
+    // Set parameter secara runtime (untuk tuning)
+    void setParameters(float q, float r, float rho) {
+      _process_noise = q;
+      _meas_noise = r;
+      _rho = rho;
+    }
+    
+    // Force reset estimate (PENTING untuk Auto Calibration)
+    void setEstimate(float est) {
+        _est_value = est;
+        _last_prediction = est;
+        _err_cov = _meas_noise; // Reset covariance
+    }
+};
+
+// ============================================================================
+// KALMAN FILTER CLASS (Simple - For Voltage)
+// ============================================================================
+class SimpleKalmanFilter {
+public:
+  SimpleKalmanFilter(float mea_e, float est_e, float q) {
+    _err_measure = mea_e;
+    _err_estimate = est_e;
+    _q = q;
+  }
+
+  float updateEstimate(float mea) {
+    _kalman_gain = _err_estimate / (_err_estimate + _err_measure);
+    _current_estimate = _last_estimate + _kalman_gain * (mea - _last_estimate);
+    _err_estimate =  (1.0 - _kalman_gain) * _err_estimate + fabs(_last_estimate - _current_estimate) * _q;
+    _last_estimate = _current_estimate;
+
+    return _current_estimate;
+  }
+
+  void setMeasurementError(float mea_e) { _err_measure = mea_e; }
+  void setEstimateError(float est_e) { _err_estimate = est_e; }
+  void setProcessNoise(float q) { _q = q; }
+  float getEstimate() { return _current_estimate; }
+  
+  // Force reset the filter estimate (useful after calibration)
+  void setEstimate(float est) { 
+      _current_estimate = est; 
+      _last_estimate = est;
+      _err_estimate = _err_measure; // Reset error covariance
+  }
+
+private:
+  float _err_measure;
+  float _err_estimate;
+  float _q;
+  float _current_estimate = 0;
+  float _last_estimate = 0;
+  float _kalman_gain = 0;
+};
+
 // ============================================================================
 // GLOBAL OBJECTS
 // ============================================================================
@@ -155,11 +326,23 @@ Preferences prefs;
 Preferences calPrefs;
 RTC_DS3231 rtc;
 
+// Kalman Filters
+// e_mea: Measurement Uncertainty - How much do we expect to our measurement vary
+// e_est: Estimation Uncertainty - Can be initilized with the same value as e_mea since the kalman filter will adjust its value.
+// q: Process Noise - usually a small number between 0.001 and 1 - how fast your measurement moves. Recommended 0.01
+SimpleKalmanFilter kalmanVolt(1.0, 1.0, 0.01);
+// SimpleKalmanFilter kalmanCurr(2.0, 2.0, 0.01); // Replaced by IndustrialKalman
+
+// Q=0.1 (Sangat lambat/stabil), R=40.0 (Noise sensor dianggap tinggi), Rho=3.0 (Threshold besar)
+// Tuning agresif untuk meredam noise saat idle
+IndustrialKalman kFilterCurrent(0.1, 40.0, 3.0);
+
 // Network Configuration
 // Network Configuration
 char wifiSSID[33] = "";      // Max 32 chars + null
 char wifiPassword[65] = "";  // Max 64 chars + null
 char apiBaseURL[128] = "";   // Max 127 chars + null
+bool debugPayload = true;    // Toggle for verbose payload logging
 String deviceId = "";           // Format: "esp32-XX:XX:XX:XX:XX:XX"
 
 // Queue for async logging
@@ -199,7 +382,7 @@ bool isRateLimited = false;
 
 // Timing for API requests (1 request per second = safe margin)
 unsigned long lastAPIRequest = 0;
-const unsigned long API_REQUEST_INTERVAL = 1000; // 1000ms = 1 second
+const unsigned long API_REQUEST_INTERVAL = 3000; // Increased to 3s to prevent queue overflow
 
 // Retry configuration
 // Retry configuration
@@ -237,7 +420,7 @@ bool chartsFirstInit = true;
 
 // Voltage smoothing for display (reduce decimal flickering)
 float displayVoltage = 0.0;
-const float VOLTAGE_ALPHA = 0.15; // Smoothing factor (0.0-1.0, lower = smoother)
+const float VOLTAGE_ALPHA = 0.12; // Smoothing factor (0.0-1.0, lower = smoother)
 
 
 // ============================================================================
@@ -268,6 +451,27 @@ float getMedianADC(int pin, int samples) {
     }
     
     return (float)raw[samples / 2];
+}
+
+/**
+ * SMART DC FILTER (Robust against AC Noise/Stray Frequencies)
+ * Samples over >20ms window to cancel out 50Hz/60Hz AC ripple.
+ * Uses Mean (Average) instead of Median for better periodic noise cancellation.
+ */
+float getSmartDCFilter(int pin, int windowMs) {
+    long sum = 0;
+    int count = 0;
+    unsigned long start = millis();
+    
+    // Sample for at least windowMs (default 40ms for 2 cycles of 50Hz)
+    while (millis() - start < windowMs) {
+        sum += analogRead(pin);
+        count++;
+        delayMicroseconds(50); // Small delay to prevent ADC saturation
+    }
+    
+    if (count == 0) return 0;
+    return (float)sum / count;
 }
 
 /**
@@ -367,10 +571,29 @@ float getInterpolatedVoltage(float rawADC) {
  * Calculate automatic current offset (zero calibration)
  */
 void calculateAutoOffset() {
-    float raw = getMedianADC(sensorPin, 100);
+    Serial.println(F(">> Calibrating Current Offset (Hold still)..."));
+    
+    // REVERT TO LEGACY LOGIC (Median Filter)
+    // As requested to match legacy behavior
+    float raw = getMedianADC(sensorPin, 100); 
+    
     float V_ADC = (raw / ADC_resolution) * V_ref;
     I_offset = (V_ADC / I_divider_factor) * I_scale_factor;
     saveCalibrationSensor();
+    
+    // CRITICAL: Reset Kalman Filter to the new raw value
+    // Agar tidak ada "drift" dari nilai lama ke nilai baru
+    kFilterCurrent.setEstimate(raw);
+    
+    // FORCE ZERO: Explicitly reset system data to 0.00
+    if (xSemaphoreTake(sysDataMutex, 100) == pdTRUE) {
+        sysData.i_used = 0.0;
+        sysData.i_regen = 0.0;
+        sysData.i_used_avg = 0.0; 
+        xSemaphoreGive(sysDataMutex);
+    }
+    
+    Serial.println(F(">> Calibration Done. Current Forced to 0.00A."));
 }
 
 // ============================================================================
@@ -427,6 +650,157 @@ void ensureWiFiConnected() {
     } else {
         wifiConnected = true;
         wifiRSSI = WiFi.RSSI(); // Update signal strength
+    }
+}
+
+// ============================================================================
+// HELPER: MENGGAMBAR IKON DINAMIS PER KOMPONEN
+// ============================================================================
+void drawDynamicIcon(int cx, int cy, int compIdx, bool status, uint16_t bgColor) {
+    // --- 1. LOGIKA KONTRAS WARNA (Auto-Contrast) ---
+    // Masalah Anda: Hijau terlalu terang untuk ikon putih.
+    // Solusi: Jika Status OK (Hijau), ikon jadi HITAM. Jika Error (Merah), ikon PUTIH.
+    uint16_t cIcon;
+    if (status) {
+        cIcon = TFT_BLACK; // Kontras tinggi di atas Hijau Neon
+    } else {
+        cIcon = TFT_WHITE; // Kontras tinggi di atas Merah
+    }
+
+    // Warna Aksen (Detail kecil)
+    // Normal: COLOR_BLUE (Fisik Merah)
+    // Error: COLOR_RED (Fisik Biru) -> Kita pakai Putih/Hitam untuk coretan agar lebih tegas
+    uint16_t cAccent = status ? COLOR_BLUE : COLOR_RED; 
+    
+    // Warna Emas untuk pin (SD Card / Chip)
+    uint16_t cGold = 0xFDA0; 
+
+    // Ukuran dasar
+    int r = 14; 
+
+    // --- 2. GAMBAR IKON REALISTIK ---
+    switch(compIdx) {
+        case 0: // RTC (Jam Analog Klasik)
+        {
+            // Frame Luar Tebal
+            tft.drawCircle(cx, cy, r, cIcon);
+            tft.drawCircle(cx, cy, r-1, cIcon); // Double stroke biar tebal
+            
+            // Titik Pusat
+            tft.fillCircle(cx, cy, 3, cAccent); 
+            
+            // Jarum Jam (Pendek & Gemuk)
+            // Menggambar garis tebal dengan offset
+            tft.drawLine(cx, cy, cx + 8, cy, cIcon);
+            tft.drawLine(cx, cy+1, cx + 8, cy+1, cIcon);
+            
+            // Jarum Menit (Panjang & Tipis - Arah jam 10)
+            tft.drawLine(cx, cy, cx - 5, cy - 9, cIcon);
+            
+            // Indikator angka 12, 3, 6, 9 (Titik kecil)
+            tft.drawPixel(cx, cy - r + 3, cIcon); // 12
+            tft.drawPixel(cx + r - 3, cy, cIcon); // 3
+            tft.drawPixel(cx, cy + r - 3, cIcon); // 6
+            tft.drawPixel(cx - r + 3, cy, cIcon); // 9
+            break;
+        }
+        case 1: // WiFi (Gelombang Melengkung Sempurna)
+        {
+            // Titik Sinyal
+            tft.fillCircle(cx, cy + 8, 3, cIcon);
+            
+            // Fungsi helper lokal untuk membuat Arc (Busur)
+            // Caranya: Gambar lingkaran ikon, lalu timpa tengahnya dengan warna BG
+            
+            // Busur 1 (Kecil)
+            tft.drawCircle(cx, cy + 8, 8, cIcon);
+            tft.drawCircle(cx, cy + 8, 9, cIcon); // Tebalkan
+            // Hapus bagian bawah/samping untuk membentuk sinyal
+            // Kita pakai fillRect bgColor untuk memotong lingkaran jadi busur atas
+            tft.fillRect(cx - 15, cy + 9, 30, 15, bgColor); // Potong bawah
+            
+            // Busur 2 (Besar)
+            tft.drawCircle(cx, cy + 8, 14, cIcon);
+            tft.drawCircle(cx, cy + 8, 15, cIcon); // Tebalkan
+            tft.fillRect(cx - 20, cy + 9, 40, 20, bgColor); // Potong bawah
+            break;
+        }
+        case 2: // API (Rantai 3D Interlocking)
+        {
+            int w = 14; int h = 8;
+            // Link 1 (Kiri Atas)
+            tft.drawRoundRect(cx - 8, cy - 6, w, h, 3, cIcon);
+            tft.drawRoundRect(cx - 7, cy - 5, w-2, h-2, 2, cIcon); // Tebalkan
+            
+            // Masking (Penghapus) di persimpangan agar terlihat saling kait
+            // Hapus bagian tengah Link 1 tempat Link 2 akan lewat
+            tft.fillRect(cx - 2, cy - 2, 6, 6, bgColor);
+
+            // Link 2 (Kanan Bawah)
+            tft.drawRoundRect(cx - 2, cy - 2, w, h, 3, cIcon);
+            tft.drawRoundRect(cx - 1, cy - 1, w-2, h-2, 2, cIcon); // Tebalkan
+            break;
+        }
+        case 3: // Volt Sens (Petir Tajam)
+        {
+            // Gunakan fillTriangle untuk sudut tajam
+            // Bagian Atas Petir
+            tft.fillTriangle(cx + 2, cy - 12, cx + 6, cy - 12, cx - 2, cy + 2, cIcon);
+            // Bagian Bawah Petir
+            tft.fillTriangle(cx + 2, cy - 2, cx - 6, cy + 12, cx - 2, cy + 12, cIcon);
+            // Penyambung tengah
+            tft.fillTriangle(cx - 2, cy + 2, cx + 2, cy - 2, cx - 2, cy - 2, cIcon);
+            break;
+        }
+        case 4: // Heap (Bar Chart Rounded)
+        {
+            int bW = 5; // Lebar bar
+            int base = cy + 10;
+            
+            // Bar 1 (Kiri - Pendek)
+            tft.fillRoundRect(cx - 8, base - 8, bW, 8, 2, cIcon);
+            // Bar 2 (Tengah - Sedang)
+            tft.fillRoundRect(cx - 1, base - 14, bW, 14, 2, cIcon);
+            // Bar 3 (Kanan - Tinggi)
+            tft.fillRoundRect(cx + 6, base - 20, bW, 20, 2, cAccent); // Aksen warna beda
+            
+            // Garis Baseline
+            tft.drawFastHLine(cx - 10, base + 2, 20, cIcon);
+            break;
+        }
+        case 5: // Storage (SD Card Realistik)
+        {
+            int w = 18; int h = 24;
+            int x = cx - w/2; int y = cy - h/2;
+            
+            // Body Kartu
+            tft.fillRoundRect(x, y, w, h, 3, cIcon);
+            // Potongan sudut kanan atas (Cut corner)
+            tft.fillTriangle(x+w, y, x+w, y+6, x+w-6, y, bgColor);
+            
+            // Stiker Label
+            tft.fillRect(x+2, y+10, w-4, 8, cAccent);
+            
+            // Pin Emas (Kuningan) - Ini kuncinya realistik
+            for(int i=0; i<4; i++) {
+                tft.fillRect(x + 3 + (i*4), y + h - 5, 2, 5, cGold);
+            }
+            break;
+        }
+    }
+
+    // --- 3. EFEK ERROR (Coretan Silang) ---
+    if (!status) {
+        int cr = 16; // Radius coretan
+        // Gunakan warna kontras untuk silang. 
+        // Jika BG Merah, silang harus Putih Tebal atau Hitam.
+        uint16_t cCross = TFT_BLACK; 
+        
+        // Garis Silang Tebal (3px)
+        // Kiri Atas ke Kanan Bawah
+        tft.drawLine(cx - cr, cy - cr, cx + cr, cy + cr, cCross);
+        tft.drawLine(cx - cr + 1, cy - cr, cx + cr + 1, cy + cr, cCross);
+        tft.drawLine(cx - cr - 1, cy - cr, cx + cr - 1, cy + cr, cCross);
     }
 }
 
@@ -525,9 +899,11 @@ bool sendDataWithRetry(LogItem item) {
     String payload;
     serializeJson(doc, payload);
     
-    // DEBUG: Print payload
-    Serial.print(F(">> Sending Payload: "));
-    Serial.println(payload);
+    // Debug print payload
+    if (debugPayload) {
+        Serial.print(F(">> Sending Payload: "));
+        Serial.println(payload);
+    }
     
     // Retry loop with exponential backoff
     for (int attempt = 0; attempt < MAX_HTTP_RETRIES; attempt++) {
@@ -596,7 +972,10 @@ bool sendDataWithRetry(LogItem item) {
         } else {
             // Other errors
             lastHTTPStatus = String(httpCode) + " ERR";
-            Serial.printf(">> HTTP %d: %s\n", httpCode, response.c_str());
+            if (httpCode > 0) {
+                if (debugPayload) Serial.printf(">> HTTP %d: %s\n", httpCode, response.c_str());
+                lastHTTPCode = httpCode;
+            }
             return false;
         }
     }
@@ -931,135 +1310,130 @@ void drawResultIcon(int x, int y, bool success) {
     }
 }
 
+// // Pastikan fungsi ini ada (dari request sebelumnya)
+// void drawResultIcon(int x, int y, bool success); 
+
+// Helper: Menggambar SATU kartu dalam grid dengan warna dinamis & kontras teks otomatis
+void drawGridCard(int x, int y, int w, int h, const char* label, int compIdx, bool status) {
+    int r = 10;       // Radius sudut card
+    int depth = 4;    // Ketebalan 3D
+    int headerH = 20; // Tinggi area label
+
+    // --- 1. LOGIKA WARNA DINAMIS ---
+    
+    // Warna Latar Belakang Card
+    uint16_t bgColor = status ? C_STATUS_OK : COLOR_RED;
+    
+    // Warna Shadow
+    uint16_t shadowColor = status ? C_SUCCESS_SH : C_ERROR_SH;
+
+    // [PERBAIKAN] Warna Teks Label
+    // Jika Sukses (Hijau Cerah) -> Teks HITAM
+    // Jika Gagal (Merah Gelap)  -> Teks PUTIH
+    uint16_t labelColor = status ? TFT_BLACK : TFT_WHITE;
+
+    // --- 2. GAMBAR CARD BODY ---
+
+    // Bayangan 3D (Shadow Layer)
+    tft.fillRoundRect(x + depth, y + depth, w, h, r, shadowColor);
+
+    // Body Kartu Full (Face Layer)
+    tft.fillRoundRect(x, y, w, h, r, bgColor);
+
+    // --- 3. GAMBAR LABEL JUDUL ---
+    
+    tft.setTextColor(labelColor, bgColor); // Set warna teks adaptif
+    tft.setTextSize(1);
+    
+    // Center text horizontal
+    int textW = tft.textWidth(label);
+    tft.setCursor(x + (w - textW)/2, y + 5);
+    tft.print(label);
+
+    // Garis pemisah tipis di bawah label
+    // Kita gunakan warna shadow/gelap agar terlihat seperti 'engraved' atau pemisah
+    // Jika status OK (background hijau terang), garisnya pakai warna shadow (hijau tua) biar kontras
+    tft.drawFastHLine(x + 5, y + headerH, w - 10, shadowColor);
+
+    // --- 4. GAMBAR IKON ---
+    int bodyCenterY = y + headerH + ((h - headerH) / 2);
+    int bodyCenterX = x + (w/2);
+
+    // Panggil fungsi ikon (Pastikan Anda sudah update drawDynamicIcon untuk terima parameter bgColor)
+    drawDynamicIcon(bodyCenterX, bodyCenterY + 2, compIdx, status, bgColor);
+}
+
 /**
  * Run comprehensive system hardware check at boot
  */
 void runSystemCheck() {
-    tft.fillScreen(COLOR_BG);
+    tft.fillScreen(C_BG_MAIN);
 
-    // --- 1. KONFIGURASI LAYOUT CARD ---
-    int pad = 10;                // Margin kiri/kanan lebih tipis biar luas
-    int panelX = pad;
-    int panelY = 15;             // Naikkan posisi Y agar muat
-    int panelW = 240 - (pad * 2);
-    int panelH = 210;            // Tinggi disesuaikan agar sisa margin bawah
-    int depth = 5;               // Ketebalan 3D
-    int radius = 12;             // Kelengkungan sudut (Rounded)
-
-    // Warna Palette
-    uint16_t cFace   = 0x2124;   // Dark Gray Body
-    uint16_t cShadow = 0x10A2;   // Deep Shadow
-    uint16_t cHeader = C_POLE;   // Light Gray Header
-
-    // --- 2. GAMBAR CARD 3D ROUNDED ---
-
-    // A. Layer Bayangan (Shadow) - Digeser ke kanan bawah
-    tft.fillRoundRect(panelX + depth, panelY + depth, panelW, panelH, radius, cShadow);
-
-    // B. Layer Body Utama (Face)
-    tft.fillRoundRect(panelX, panelY, panelW, panelH, radius, cFace);
-
-    // C. Header Area (Top Section)
-    // Trik: Gambar Rounded Rect penuh untuk header, lalu timpa separuh bawahnya
-    // agar sudut atas bulat, tapi bawahnya rata menyatu dengan body.
-    int headerH = 38;
-    tft.fillRoundRect(panelX, panelY, panelW, headerH, radius, cHeader);
-    tft.fillRect(panelX, panelY + (headerH/2), panelW, headerH/2, cHeader); // Ratakan bawah header
-    
-    // Garis pemisah header & body
-    tft.drawFastHLine(panelX, panelY + headerH, panelW, 0x528A); 
-
-    // D. Header Title & Decor
-    tft.setTextColor(TFT_BLACK, cHeader);
+    // --- 1. HEADER ---
+    tft.setTextColor(TFT_WHITE, C_BG_MAIN);
     tft.setTextSize(2);
-    tft.setCursor(panelX + 15, panelY + 12);
+    tft.setCursor(50, 15); 
     tft.print("SYSTEM DIAG");
+    tft.drawFastHLine(20, 40, 200, C_POLE);
 
-    // Lampu Indikator Power (Pojok Kanan Atas)
-    tft.fillCircle(panelX + panelW - 20, panelY + 19, 6, TFT_BLACK); // Housing
-    tft.fillCircle(panelX + panelW - 20, panelY + 19, 4, TFT_CYAN);  // LED ON
+    // --- 2. KONFIGURASI GRID 2x3 ---
+    int marginX = 10;
+    int startY = 55;
+    int gap = 10;
+    // Hitung dimensi agar pas 2x3
+    int cardW = (240 - (marginX * 2) - (gap * 2)) / 3; 
+    int cardH = 75; 
 
-    // --- 3. LOGIKA CEK BERURUTAN ---
-    
-    // Koordinat isi
-    int startY = panelY + headerH + 15; // Jarak dari header
-    int gapY = 32; // Jarak antar item dirapatkan sedikit agar muat
-    int currentY = startY;
+    // Daftar Komponen (Sesuai request ikon)
+    const char* components[] = { 
+        "RTC", "WiFi", "API", 
+        "Volt Sens", "Heap", "Storage" 
+    };
+    int compCount = 6;
+    bool overallStatus = true;
 
-    const char* components[] = { "RTC DS3231", "WiFi Conn", "API Check", "Sensor Volt" };
-    int compCount = 4;
-    
-    bool overallStatus = true; 
-
+    // --- FASE SCANNING & DRAWING ---
     for (int i = 0; i < compCount; i++) {
-        // A. Tulis Nama Komponen
-        tft.setTextColor(TFT_WHITE, cFace);
-        tft.setTextSize(1);
-        tft.setCursor(panelX + 15, currentY + 5);
-        tft.print(components[i]);
-        
-        // Animasi Loading (...)
-        int dotX = panelX + 130;
-        // Kita simpan posisi kursor dot biar bisa dihapus rapi
-        for(int d=0; d<3; d++) {
-            tft.setCursor(dotX + (d*6), currentY + 5);
-            tft.print(".");
-            delay(100); 
-        }
+        // Tentukan Posisi
+        int col = i % 3; int row = i / 3;
+        int cx = marginX + col * (cardW + gap);
+        int cy = startY + row * (cardH + gap);
 
-        // B. Cek Hardware (Gunakan variabel global status Anda)
-        bool result = false;
+        // --- Lakukan Pengecekan Hardware Real ---
+        // GANTI DENGAN VARIABEL/FUNGSI STATUS REAL ANDA DI SINI
+        bool result = false; 
         switch(i) {
-            case 0: result = rtcReady; break;            // Pastikan variabel ini ada
-            case 1: result = wifiConnected; break;             // Check WiFi instead of SD
-            case 2: result = (lastHTTPCode == 200); break;     // Check API Health (from setup)
-            case 3: 
-                // Check if calibrated OR if raw ADC detects voltage (> 0.2V approx)
-                // This prevents failure if uncalibrated but connected, or calibrated but 0V
-                result = (calPointCount >= 1) || (analogRead(batteryPin) > 50); 
-                break;
+            case 0: result = rtcReady; break;           
+            case 1: result = wifiConnected; break;      
+            case 2: result = (lastHTTPCode == 200); break;
+            // Contoh logika Volt: True jika terkalibrasi ATAU ada tegangan terbaca
+            case 3: result = (calPointCount >= 1) || (analogRead(batteryPin) > 100); break; 
+            // Contoh logika Heap: True jika free heap > 50KB
+            case 4: result = (ESP.getFreeHeap() > 50000); break;
+            case 5: result = sdReady; break; 
         }
 
         if (!result) overallStatus = false;
 
-        // C. Gambar Hasil
-        // Hapus area loading dots dengan kotak warna body
-        tft.fillRect(dotX, currentY, 40, 15, cFace); 
-        
-        // Gambar Ikon (Fungsi drawResultIcon harus sudah ada)
-        // Posisi X ikon diratakan kanan dengan margin
-        drawResultIcon(panelX + panelW - 25, currentY + 8, result);
+        // --- GAMBAR KARTU DINAMIS ---
+        // Kirim index 'i' agar ikonnya sesuai
+        drawGridCard(cx, cy, cardW, cardH, components[i], i, result);
 
-        // Garis pemisah tipis (kecuali item terakhir)
-        if (i < compCount - 1) {
-            // Garis putus-putus atau solid tipis warna gelap
-            tft.drawFastHLine(panelX + 15, currentY + gapY - (gapY/2) + 2, panelW - 30, 0x3186);
-        }
-        
-        // Pindah baris
-        currentY += gapY;
+        // Jeda animasi agar terasa seperti "scanning" satu per satu
+        delay(200); 
     }
 
-    // --- 4. FOOTER STATUS (Floating Pill Style) ---
-    // Agar tidak merusak rounded corner bawah panel, footer dibuat "mengambang"
-    // di dalam panel bagian bawah.
-    
-    int footerH = 34;
-    int footerY = panelY + panelH - footerH - 10; // Margin 10px dari bawah panel
-    int footerX = panelX + 15;
-    int footerW = panelW - 30;
+    // --- 3. FOOTER STATUS ---
+    int footerY = startY + (2 * (cardH + gap)) + 15; 
+    int footerH = 34; int footerW = 200; int footerX = (240 - footerW) / 2;
 
-    uint16_t statusColor = overallStatus ? 0x03E0 : 0xF965; // Hijau vs Merah Apple
+    uint16_t statusColor = overallStatus ? C_STATUS_OK : C_STATUS_FAIL;
     
-    // Gambar Background Footer (Rounded)
-    tft.fillRoundRect(footerX, footerY, footerW, footerH, 8, statusColor);
+    tft.fillRoundRect(footerX, footerY, footerW, footerH, 17, statusColor);
     
-    // Teks Status
     tft.setTextColor(TFT_WHITE, statusColor);
     tft.setTextSize(2);
-    
     String finalMsg = overallStatus ? "SYSTEM READY" : "CHECK FAILED";
-    // Center text di dalam tombol footer
     tft.setCursor(footerX + (footerW - tft.textWidth(finalMsg))/2, footerY + 9);
     tft.print(finalMsg);
     
@@ -1235,7 +1609,14 @@ public:
         
         // Always recreate sprite (was deleted in end())
         sprite = new TFT_eSprite(tft);
+        sprite->setColorDepth(8); // Use 8-bit color to save RAM (Fix invisible chart)
         sprite->createSprite(width, height);
+        
+        if (!sprite) {
+            Serial.println(">> ERROR: Failed to create Slide1 sprite (Low RAM)");
+            return;
+        }
+        
         refresh();
     }
 
@@ -1343,8 +1724,8 @@ private:
             tft->print(unit);
         };
         
-        // Shifted X to 10 for better left alignment
-        printValue(10, y, ch1.name, v1, 1, "V", ch1.color);
+        // Shifted X to 6 for better left alignment (was 10)
+        printValue(6, y, ch1.name, v1, 2, "V", ch1.color);
         
         // Uptime
         unsigned long sec = sysData.uptime_sec;
@@ -1414,7 +1795,14 @@ public:
         
         // Always recreate sprite (was deleted in end())
         sprite = new TFT_eSprite(tft);
+        sprite->setColorDepth(8); // Use 8-bit color to save RAM (Fix invisible chart)
         sprite->createSprite(width, height);
+        
+        if (!sprite) {
+            Serial.println(">> ERROR: Failed to create Slide2 sprite (Low RAM)");
+            return;
+        }
+        
         refresh();
     }
 
@@ -1522,17 +1910,17 @@ private:
             tft->print(unit);
         };
         
-        // Shifted X to 10 for better left alignment
-        printValue(10, y, ch1.name, v1, 1, "V", ch1.color);
+        // Shifted X to 6 for better left alignment (was 10)
+        printValue(6, y, ch1.name, v1, 2, "V", ch1.color);
         
         // Efficiency
-        tft->setCursor(130, y);
+        tft->setCursor(126, y); // Shifted left (was 130)
         tft->setTextColor(COLOR_TEXT_V, COLOR_BG);
         tft->setTextSize(1);
         tft->print("Efisiensi");
-        tft->setCursor(130, y + 10);
+        tft->setCursor(126, y + 10);
         tft->setTextSize(2);
-        dtostrf(eff, 4, 1, buffer);
+        dtostrf(eff, 4, 2, buffer); // 2 decimals
         tft->print(buffer);
         tft->setTextSize(1);
         tft->setCursor(tft->getCursorX() + 2, y + 17);
@@ -1601,7 +1989,7 @@ private:
         if (!isFooter) {
             // --- MODE CARD (Angka Besar) ---
             // Area hapus (di dalam card)
-            int valX = x + 12;
+            int valX = x + 8; // Shifted left (was x + 12) for alignment
             int valY = y + 22; // Di bawah label
             
             // Hapus angka lama dengan warna Card Body
@@ -1675,8 +2063,8 @@ public:
 
     void update(volatile SystemData &data) {
         // Data Utama (Card Besar)
-        printValue(0, displayVoltage, 1, "V", TFT_WHITE);      // Volt
-        printValue(1, data.efficiency, 1, "%", COLOR_GREEN); // Eff
+        printValue(0, displayVoltage, 2, "V", TFT_WHITE);      // Volt (2 decimals)
+        printValue(1, data.efficiency, 2, "%", COLOR_GREEN); // Eff (2 decimals)
         printValue(2, data.i_used_avg, 2, "A", COLOR_BLUE);  // Curr Avg
         printValue(3, data.i_used_max, 2, "A", 0x001F);      // Curr Max
         printValue(4, data.wh_used, 2, "Wh", COLOR_RED);  // Energy Used
@@ -1781,66 +2169,129 @@ public:
 
 private:
     void drawContent() {
-        // Draw WiFi Icon (Simple representation)
-        int cx = 120;
-        int cy = 60;
+        tft->fillScreen(COLOR_BG);
+
+        // 1. CONFIG POSISI BARU (Agar muat Pesawat Besar)
+        int cx = 120; 
+        int cy = 70;  // Posisi awal pesawat NAIK sedikit (biar ekor ga nabrak)
         
-        // Dot
-        tft->fillCircle(cx, cy + 20, 4, COLOR_GREEN);
+        int titleY = 135; // Judul TURUN (sebelumnya 120)
         
-        // Arcs (using circles and masking)
-        // Arc 1
-        tft->drawCircle(cx, cy + 20, 15, TFT_WHITE);
-        tft->drawCircle(cx, cy + 20, 16, TFT_WHITE);
-        tft->fillRect(cx - 20, cy + 20, 40, 20, COLOR_BG);
+        int cardY = 160;  // Card TURUN (sebelumnya 145)
+        int cardH = 50;   // Card LEBIH PENDEK (sebelumnya 65) -> Tampilan Compact
+        int cardX = 15;   
+        int cardW = 210;  // Sedikit lebih lebar
+
+        // --- 2. GAMBAR UI STATIS (Lapisan Bawah) ---
         
-        // Arc 2
-        tft->drawCircle(cx, cy + 20, 25, TFT_WHITE);
-        tft->drawCircle(cx, cy + 20, 26, TFT_WHITE);
-        tft->fillRect(cx - 30, cy + 20, 60, 30, COLOR_BG);
-        
-        // Arc 3
-        // Arc 3
-        tft->drawCircle(cx, cy + 20, 35, TFT_WHITE);
-        tft->drawCircle(cx, cy + 20, 36, TFT_WHITE);
-        tft->fillRect(cx - 40, cy + 20, 80, 40, COLOR_BG);
-        
-        // Title
+        // TITLE: "DATA SENT!"
         tft->setTextColor(CALIB_COLOR_DONE, COLOR_BG);
         tft->setTextSize(2);
         String title = "DATA SENT!";
-        tft->setCursor((240 - tft->textWidth(title)) / 2, 110); 
+        tft->setCursor((240 - tft->textWidth(title)) / 2, titleY); 
         tft->print(title);
-        
-        // Info Box
-        int infoBoxY = 140;
-        tft->drawFastHLine(20, infoBoxY, 200, TFT_GREY);
-        tft->drawFastHLine(20, infoBoxY + 60, 200, TFT_GREY);
-        
-        // Total Points
-        tft->setTextSize(1);
-        tft->setTextColor(0xBDF7, COLOR_BG);
-        tft->setCursor(30, infoBoxY + 10);
-        tft->print("Total Points Sent:");
-        
-        tft->setTextSize(2);
-        tft->setTextColor(TFT_WHITE, COLOR_BG);
-        tft->setCursor(30, infoBoxY + 25);
-        tft->print(logIteration);
-        
-        // Device ID
-        tft->setTextSize(1);
-        tft->setTextColor(0xBDF7, COLOR_BG);
-        tft->setCursor(30, infoBoxY + 45);
-        tft->print("ID: " + deviceId);
 
-        // Footer Instruction
-        tft->setTextSize(1);
-        tft->setCursor((240 - tft->textWidth("Tekan tombol untuk lanjut")) / 2, 220);
-        tft->setTextColor(TFT_WHITE, COLOR_BG);
-        tft->print("Tekan tombol untuk lanjut");
+        // INFO CARD (Compact Version)
+        // Background Card
+        tft->fillRoundRect(cardX, cardY, cardW, cardH, 8, 0x2124); // Dark Grey
+        // Aksen Hijau (Strip Kiri)
+        tft->fillRoundRect(cardX, cardY, 6, cardH, 8, CALIB_COLOR_DONE);
+        tft->fillRect(cardX+3, cardY, 3, cardH, CALIB_COLOR_DONE); // Square off right side of strip
+
+        // --- ISI CARD (Split Kiri & Kanan) ---
         
-        // drawPageNumber(4); // Removed as requested
+        // BAGIAN KIRI: POINTS (Prioritas Utama)
+        int leftPad = cardX + 15;
+        
+        tft->setTextSize(1);
+        tft->setTextColor(0xBDF7, 0x2124); // Label Color
+        tft->setCursor(leftPad, cardY + 8);
+        tft->print("POINTS");
+        
+        tft->setTextSize(2); // Angka Besar
+        tft->setTextColor(TFT_WHITE, 0x2124);
+        tft->setCursor(leftPad, cardY + 20);
+        tft->print(logIteration);
+
+        // BAGIAN KANAN: DEVICE ID (Smart Layout)
+        int rightPad = cardX + 110; // Titik mulai kolom kanan
+        
+        tft->setTextSize(1);
+        tft->setTextColor(0xBDF7, 0x2124); // Label Color
+        tft->setCursor(rightPad, cardY + 8);
+        tft->print("DEVICE ID");
+
+        // Logic Penanganan String Panjang (Wrap / Truncate)
+        tft->setTextColor(TFT_WHITE, 0x2124);
+        tft->setCursor(rightPad, cardY + 22); // Sejajar dengan angka points
+        
+        String dispID = deviceId;
+        int maxChar = 11; // Batas karakter agar muat di setengah kartu
+        
+        if (dispID.length() <= maxChar) {
+            // Jika pendek, cetak normal
+            tft->print(dispID);
+        } else {
+            // Jika panjang, potong dan beri ".." agar estetik & tidak overlap
+            // Opsi Wrap 2 baris tidak dipakai karena tinggi card diperpendek (50px)
+            tft->print(dispID.substring(0, maxChar - 2) + "..");
+        }
+
+        // FOOTER (Paling Bawah)
+        tft->setTextSize(1);
+        tft->setTextColor(0x7BEF, COLOR_BG); 
+        String footer = "Tekan tombol lanjut"; // Teks diperpendek sedikit
+        tft->setCursor((240 - tft->textWidth(footer)) / 2, 228); // Mepet bawah
+        tft->print(footer);
+
+        // --- 3. ANIMASI PESAWAT BESAR (Skala 1.6x) ---
+        // Koordinat animasi disesuaikan dengan posisi CY baru
+        
+        for(int i = 0; i < 60; i+=4) {
+            int px = cx + i;       
+            int py = cy - (i / 1.5); 
+            
+            // Hapus jejak (Clearing)
+            if(i > 0) {
+                int prevX = cx + (i-4);
+                int prevY = cy - ((i-4)/1.5);
+                // Area hapus cukup besar tapi hati-hati jangan kena Judul di Y=135
+                // Ujung bawah pesawat (py+32) kira-kira di Y=100 saat start. Aman.
+                tft->fillRect(prevX - 50, prevY - 30, 85, 85, COLOR_BG);
+            }
+
+            // --- GEOMETRI PESAWAT (Sama seperti sebelumnya) ---
+            // Sayap Kiri
+            tft->fillTriangle(px, py, px - 32, py + 24, px - 44, py + 12, C_PLANE_BODY);
+            // Sayap Kanan
+            tft->fillTriangle(px, py, px - 32, py + 24, px - 16, py + 32, C_PLANE_SHADE);
+            // Crease
+            tft->drawLine(px, py, px - 32, py + 24, 0x2124); 
+
+            // Trail
+            if (i > 10) {
+                tft->drawLine(px - 55, py + 28, px - 70, py + 36, C_TRAIL); 
+                tft->drawLine(px - 50, py + 16, px - 65, py + 20, C_TRAIL); 
+            }
+
+            delay(30); 
+        }
+
+        // --- 4. FINAL STATIC DRAW ---
+        int finalX = cx + 60;
+        int finalY = cy - 40;
+        
+        tft->fillTriangle(finalX, finalY, finalX - 32, finalY + 24, finalX - 44, finalY + 12, C_PLANE_BODY);
+        tft->fillTriangle(finalX, finalY, finalX - 32, finalY + 24, finalX - 16, finalY + 32, C_PLANE_SHADE);
+        tft->drawLine(finalX, finalY, finalX - 32, finalY + 24, 0x2124);
+
+        // Badge Sukses (Digeser agar pas di sayap)
+        int badgeX = finalX + 10;
+        int badgeY = finalY - 10;
+        tft->fillCircle(badgeX, badgeY, 10, CALIB_COLOR_DONE);
+        tft->drawCircle(badgeX, badgeY, 10, TFT_WHITE);
+        tft->drawLine(badgeX - 3, badgeY, badgeX, badgeY + 4, TFT_WHITE);
+        tft->drawLine(badgeX, badgeY + 4, badgeX + 5, badgeY - 4, TFT_WHITE);
     }
 };
 
@@ -2060,6 +2511,9 @@ void stopLogging() {
     Serial.println(F(">> Queue flushed"));
     Serial.printf(">> Total iterations: %lu\n", logIteration);
     
+    // Enable Slide 4 (Network Info / Summary)
+    showFileInfoSlide = true;
+    
     drawStopLoggingUI();
 }
 
@@ -2171,7 +2625,8 @@ void processSerial(String input) {
         Serial.println(F(">> COMMAND: AUTO"));
         Serial.println(F(">> ACTION: Auto current offset calibration..."));
         
-        if (!calib_curr_done) {
+        // Allow forcing recalibration even if already done
+        if (true) { 
             calib_curr_done = true;
             prefs.begin("calib_ui", false);
             prefs.putBool("c_curr", true);
@@ -2332,6 +2787,25 @@ void processSerial(String input) {
         }
     }
     
+    // Command: SET_DEBUG <0/1>
+    else if (input.startsWith("SET_DEBUG ")) {
+        Serial.println(F(">> COMMAND: SET_DEBUG"));
+        String val = input.substring(10);
+        val.trim();
+        
+        if (val == "1" || val.equalsIgnoreCase("ON") || val.equalsIgnoreCase("TRUE")) {
+            debugPayload = true;
+        } else {
+            debugPayload = false;
+        }
+        
+        // Save to Preferences
+        prefs.begin("network", false);
+        prefs.putBool("debug_payload", debugPayload);
+        prefs.end();
+        
+        Serial.printf(">> STATUS: Debug Logging %s\n", debugPayload ? "ENABLED" : "DISABLED");
+    }
     
     // --- LEGACY: FILE MANAGEMENT COMMANDS (Commented for HTTP API mode) ---
     /*
@@ -2386,6 +2860,7 @@ void processSerial(String input) {
         }
         Serial.printf("   Calibrated: %s\n", system_calibrated ? "YES" : "NO");
         Serial.printf("   Uptime: %lu s\n", sysData.uptime_sec);
+        Serial.printf("   Debug Mode: %s\n", debugPayload ? "ON" : "OFF");
     }
     // Command: help
     else if (input.equalsIgnoreCase("help") || input.equalsIgnoreCase("?")) {
@@ -2393,6 +2868,7 @@ void processSerial(String input) {
         Serial.println(F("   === NETWORK ==="));
         Serial.println(F("   SET_WIFI <ssid> <pass> : Configure WiFi"));
         Serial.println(F("   SET_API <url>          : Set API endpoint"));
+        Serial.println(F("   SET_DEBUG <1/0>        : Toggle verbose logging"));
         Serial.println(F("   status                 : Show system status"));
         Serial.println(F("   === CALIBRATION ==="));
         Serial.println(F("   reset_all              : Reset calibration"));
@@ -2596,23 +3072,62 @@ void dataTask(void *parameter) {
             xSemaphoreGive(sysDataMutex);
         }
         
+        // Apply Kalman Filter for Voltage
+        float k_voltage = kalmanVolt.updateEstimate(sysData.voltage);
+        
         // Apply smoothing for display (reduce decimal flickering from noise)
         if (displayVoltage == 0.0) {
-            displayVoltage = sysData.voltage; // Initialize
+            displayVoltage = k_voltage; // Initialize
         } else {
             // Exponential moving average: slower for decimals, faster for whole numbers
-            displayVoltage = (VOLTAGE_ALPHA * sysData.voltage) + ((1.0 - VOLTAGE_ALPHA) * displayVoltage);
+            displayVoltage = (VOLTAGE_ALPHA * k_voltage) + ((1.0 - VOLTAGE_ALPHA) * displayVoltage);
         }
 
         
-        // Read current
-        float rawCurrent = getMedianADC(sensorPin, 20);
-        float V_adc_current = (rawCurrent / ADC_resolution) * V_ref;
-        float V_sensor = (V_adc_current / I_divider_factor) * I_scale_factor;
-        float I_raw = (V_sensor - I_offset) / I_sensitivity;
+        // Read current (INDUSTRIAL KALMAN FILTER)
+        // Fungsi .update() sudah melakukan oversampling & adaptive filtering
+        float raw_curr_filtered = kFilterCurrent.update(sensorPin);
         
-        // Apply dead zone
-        if (abs(I_raw) < 0.15) I_raw = 0.0;
+        float V_ADC_curr = (raw_curr_filtered / ADC_resolution) * V_ref;
+        float V_measured_curr = (V_ADC_curr / I_divider_factor) * I_scale_factor;
+        float I_raw = (V_measured_curr - I_offset) / I_sensitivity;
+        
+        // Apply dead zone (Increased to 0.20A to ensure 0.00A display)
+        if (abs(I_raw) < 0.20) I_raw = 0.0;
+        
+        // --- AUTO-ZERO ON IDLE ALGORITHM ---
+        // If current is consistently near zero (< 0.25A) for 5 seconds, 
+        // assume it's idle and fine-tune the offset.
+        static unsigned long idleStartTime = 0;
+        static bool isIdle = false;
+        
+        if (abs(I_raw) == 0.0) { // Using deadzoned value
+             if (!isIdle) {
+                 idleStartTime = millis();
+                 isIdle = true;
+             } else if (millis() - idleStartTime > 5000) { // 5 seconds stable
+                 // Perform fine-tune auto-zero
+                 // Only if we haven't done it recently (debounce)
+                 static unsigned long lastAutoZero = 0;
+                 if (millis() - lastAutoZero > 60000) { // Max once per minute
+                     Serial.println(F(">> Auto-Zeroing Idle Current..."));
+                     float rawIdle = getMedianADC(sensorPin, 50);
+                     float V_ADC_Idle = (rawIdle / ADC_resolution) * V_ref;
+                     float newOffset = (V_ADC_Idle / I_divider_factor) * I_scale_factor;
+                     
+                     // Only update if change is small (prevent zeroing on actual load)
+                     if (abs(newOffset - I_offset) < 0.1) {
+                         I_offset = newOffset;
+                         saveCalibrationSensor();
+                         Serial.printf(">> New Offset: %.4f\n", I_offset);
+                     }
+                     lastAutoZero = millis();
+                 }
+             }
+        } else {
+            isIdle = false;
+        }
+
         // Read voltage safely for deadzone check
         float currentVoltage = 0;
         if (xSemaphoreTake(sysDataMutex, portMAX_DELAY) == pdTRUE) {
@@ -2806,6 +3321,8 @@ void setup() {
     strncpy(apiBaseURL, s_url.c_str(), sizeof(apiBaseURL) - 1);
     apiBaseURL[sizeof(apiBaseURL) - 1] = '\0';
     
+    debugPayload = prefs.getBool("debug_payload", true);
+    
     prefs.end();
     
     if (strlen(wifiSSID) > 0) {
@@ -2845,7 +3362,19 @@ void setup() {
     calib_rtc_done = prefs.getBool("c_rtc", false);
     prefs.end();
     
+    // Load Sensor Calibration Data
     I_offset = calPrefs.getFloat("i_off", I_offset);
+    
+    // FIX: Load Voltage Map correctly
+    if (calPrefs.isKey("v_map")) {
+        calPrefs.getBytes("v_map", voltageMap, sizeof(voltageMap));
+        calPointCount = calPrefs.getInt("v_count", 0);
+        
+        if (calPointCount >= MIN_CAL_POINTS) {
+            sensorSystemValid = true;
+            Serial.printf(">> Loaded %d voltage calibration points\n", calPointCount);
+        }
+    }
     
     calPrefs.end();
     
@@ -2866,8 +3395,8 @@ void setup() {
     }
     
     // Initialize Logging Queue
-    // Initialize Logging Queue
-    logQueue = xQueueCreate(50, sizeof(LogItem)); // Increased buffer to 50 items
+    // Create log queue (Increased to 100 to handle bursts)
+    logQueue = xQueueCreate(100, sizeof(LogItem));
     
     // Initialize Mutexes
     sysDataMutex = xSemaphoreCreateMutex();

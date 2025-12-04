@@ -27,10 +27,13 @@ This release transforms the device from a local logger to a cloud-connected IoT 
 - **New Commands**:
   - `SET_WIFI <ssid> <pass>`: Configure WiFi credentials.
   - `SET_API <url>`: Configure backend endpoint.
+  - `SET_DEBUG <1/0>`: Toggle verbose payload logging (Persistent).
 - **Persistent Storage**: Credentials saved in NVS (Preferences).
 
-### 4. Memory Optimization
-- **Safe Strings**: Replaced global `String` objects with `char` arrays to prevent heap fragmentation.
+### 4. System Diagnostics & UI
+- **Heap Integrity Check**: Added RAM check to boot diagnostic (>50KB free).
+- **Network Info Slide**: Automatically displays "DATA SENT" summary after logging stops.
+- **Memory Optimization**: Replaced global `String` objects with `char` arrays.
 - **Stack Safety**: Increased `loggingTask` stack to 12KB for safe HTTPS SSL handshakes.
 - **Efficient Sorting**: Switched to Insertion Sort for faster ADC noise filtering.
 

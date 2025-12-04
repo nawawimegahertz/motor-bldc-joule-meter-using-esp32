@@ -185,6 +185,7 @@ v48.2    # When multimeter shows 48.2V
 # 3. Configure Network (New in v3.0)
 SET_WIFI MySSID MyPassword
 SET_API https://my-backend.app
+SET_DEBUG 1  # Enable verbose logging (Optional)
 
 # 4. Set RTC time
 SET_TIME 2025 12 03 14 30 00
